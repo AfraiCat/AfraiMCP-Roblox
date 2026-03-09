@@ -1,0 +1,104 @@
+---
+description: Why you should and how you should use the Roblox MCP.
+alwaysApply: true
+---
+
+# This is how to use the Roblox MCP and when to use it.
+
+## What changed:
+
+- **clear_console** – New tool to clear the Studio output window and captured buffer. Use before running code when you need fresh output.
+- **Studio mode awareness** – Commands run in edit mode only; the plugin does not initialize during play mode. Use `start_stop_play` to control play, then run commands when stopped.
+- **Prefer dedicated tools** – Use `get_instance_tree`, `get_properties`, `batch_apply` over `run_code` when possible for better performance.
+
+## Warning:
+
+- **Please refrain from ever editing anything inside the Studio unless specifically asked to do so**
+- **Even when asked to do something check if it already exists or if there is a place for it and use it as intended do not create things without making sure they don't exist already, you can ask the user always if you feel confused and just save it for the end to ask**
+- **Sometimes you will see other names like my name is AfraiC4t in game other players might be team members in the studio please ignore them for testing.**
+
+## Important:
+
+- **UI Implementation**: When you are making UI just use the MCP to directly put it in StarterGUI. Do not make it in script unless it physically has to be, or unless editing it AKA stat changes and such.
+- **Testing**: Please test as much as possible using the MCP play and testing features instead of making me test when you can easily see if there was a bug.
+- **Organizing and grouping**: Please when inserting things that are a couple but connected to each other, either put them under a single folder together or in a group if it's things that should be moved together and such.
+- **Stick to scale**: When creating or scripting UI, try to stay away from using offset when you can as scale works much better.
+- **Knowing who and where**: When something is only a decoration for example it should be put under a folder called "Decoration" or "Map", and when it has a function a folder like "Functionionable" and something fully to be ignored then like "Ignored" such as invis walls and that. This helps scriptings and ignoring for Raycasting or Touch Events.
+- **Stopping when done testing**: When you are done testing something please make sure you stop the testing/game and not just leave it at that.
+
+## Included tools:
+
+**Read & inspect:**
+- **get_instance_tree** – Get hierarchy/structure as JSON. **Preferred over `run_code` for structure checks.**
+- **get_properties** – Read instance properties directly. **Preferred over `run_code` for reading values.**
+- **get_asset_ids** – Get rbxassetid from images, sounds, etc.
+- **read_datastore** – Inspect DataStore values (dev storage). Use for checking player data.
+- **mock_datastore** – Set values in DataStore for testing. Uses Studio dev storage.
+
+**Modify:**
+- **batch_apply** – Set properties on multiple instances (by tag, className, or path). **Preferred over `run_code` loops.**
+- **insert_model** – Inserts a model from the Roblox Creator Store into the workspace.
+
+**Navigation:**
+- **select_instances** – Select instances in Explorer.
+- **open_script** – Open a script in the Script Editor.
+
+**Console & debugging:**
+- **get_console_output** – Get the captured console output from Roblox Studio.
+- **clear_console** – Clear the Studio output window and captured buffer. Use before running code for fresh output.
+
+**Play mode:**
+- **get_studio_mode** – Get current mode (start_play, run_server, or stop).
+- **start_stop_play** – Start or stop play mode, or run server only.
+- **run_script_in_play_mode** – Run a script in play mode and auto-stop. Prefer `start_stop_play` for interactive testing.
+
+**Code execution:**
+- **run_code** – Run Lua in Studio and return printed output. **Use only for custom logic when no dedicated tool exists.**
+
+**Rojo (host machine, requires Rojo installed):**
+- **rojo_sourcemap** – Get file-to-instance mapping.
+- **rojo_build** – Build/sync project.
+
+
+## When to **ALWAYS** use it:
+
+- A change that requires knowledge of a structure or a location of something.
+- Want to debug something that wouldn't require the player to play it himself for any reasons.
+- When you are scripting something that requires a RemoteEvent add it using `run_code`
+
+
+## When should you use it:
+
+- **Example 1:** You need to understand a structure of an UI or model.
+- **Solution:** Use `get_instance_tree` to see the hierarchy instantly.
+
+- **Example 2:** You need to check the properties of a specific part (e.g., Color, Size, Position).
+- **Solution:** Use `get_properties` with the instance path.
+
+- **Example 3:** You need to change the Color of all Parts tagged as "Enemy" to red, or set the Size of all "Conveyor" parts.
+- **Solution:** Use `batch_apply` with selector, selectorValue, property, and value:
+    - By tag: `selector: "tag"`, `selectorValue: "Enemy"`, `property: "Color"`, `value: [1, 0, 0]`
+    - By className: `selector: "className"`, `selectorValue: "Part"`, `property: "Size"`, `value: [4, 4, 4]`
+    - By path: `selector: "path"`, `selectorValue: "Workspace.MyModel"`, `property: "Color"`, `value: [0, 1, 0]`
+
+- **Example 4:** You want to see what is stored in a player's DataStore or set test data.
+- **Solution:** Use `read_datastore` to inspect values. Use `mock_datastore` to set test data for development scenarios.
+
+- **Example 5:** You want to make sure that the code is working correctly or want to debug it yourself.
+- **Solution:** Check status with `get_studio_mode`, use `start_stop_play` to start/stop. Use `clear_console` before running code for fresh output, then `get_console_output` to see logs.
+
+- **Example 6:** You want to test if the `DataManager` is correctly updating a player's money.
+- **Solution:** Use `run_code` to require the module via your framework and call a method (since this is custom logic):
+    ```lua
+    local Requirer = game:GetService("ReplicatedStorage"):WaitForChild("Requirer")
+    local DataManager = Requirer.require("ServerScriptService", "DataManager")
+    -- I can then print results or modify values directly to test logic
+    ```
+
+- **Example 7:** You want to help the user find a specific script or object in their Explorer.
+- **Solution:** Use `select_instances` or `open_script` to highlight it for them.
+
+
+## What to be careful and acknowledge:
+
+- This effects the actual real studio game save, running commands that can effect important aspects or delete things may cause harm if not done carefully.
