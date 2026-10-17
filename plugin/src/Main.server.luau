@@ -68,15 +68,15 @@ local function toolCallHandler(args: Types.ToolArgs): string
 	-- Unique recording name so overlapping write tools don't collide.
 	local recording = if isReadOnly
 		then nil
-		else ChangeHistoryService:TryBeginRecording("StudioMCP:" .. toolName .. ":" .. HttpService:GenerateGUID(false))
+		else ChangeHistoryService:TryBeginRecording(
+			"StudioMCP:" .. toolName .. ":" .. HttpService:GenerateGUID(false)
+		)
 
 	local success, response = pcall(ToolDispatcher.dispatchTool, toolName, toolArgs)
 	if recording then
 		ChangeHistoryService:FinishRecording(
 			recording,
-			if success
-				then Enum.FinishRecordingOperation.Commit
-				else Enum.FinishRecordingOperation.Cancel
+			if success then Enum.FinishRecordingOperation.Commit else Enum.FinishRecordingOperation.Cancel
 		)
 	end
 

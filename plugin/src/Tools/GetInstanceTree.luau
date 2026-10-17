@@ -22,7 +22,11 @@ local function serializeInstance(
 
 	nodeCount[1] += 1
 	if nodeCount[1] > MAX_NODE_COUNT then
-		return { _truncated = true, _reason = "max_node_count_exceeded", _hint = "Use a narrower rootPath or lower maxDepth" }
+		return {
+			_truncated = true,
+			_reason = "max_node_count_exceeded",
+			_hint = "Use a narrower rootPath or lower maxDepth",
+		}
 	end
 
 	local result: { [string]: any } = {
@@ -36,7 +40,8 @@ local function serializeInstance(
 		result.Size = { instance.Size.X, instance.Size.Y, instance.Size.Z }
 		result.Color = { instance.Color.R, instance.Color.G, instance.Color.B }
 	elseif instance:IsA("Model") then
-		result.PivotPosition = { instance:GetPivot().Position.X, instance:GetPivot().Position.Y, instance:GetPivot().Position.Z }
+		result.PivotPosition =
+			{ instance:GetPivot().Position.X, instance:GetPivot().Position.Y, instance:GetPivot().Position.Z }
 	end
 
 	local attrs = instance:GetAttributes()

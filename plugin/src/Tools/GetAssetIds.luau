@@ -38,7 +38,10 @@ local function extractAssetIdFromRbxAsset(rbxAsset: string): number?
 	return nil
 end
 
-local function getAssetIdsFromInstance(instance: Instance, assetTypes: { string }?): { { id: number, path: string, property: string, type: string } }
+local function getAssetIdsFromInstance(
+	instance: Instance,
+	assetTypes: { string }?
+): { { id: number, path: string, property: string, type: string } }
 	local results = {}
 	local instanceType = instance.ClassName
 
