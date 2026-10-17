@@ -8,11 +8,16 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{self, EnvFilter};
+mod asset_types;
+mod audit;
+mod auth;
 mod error;
 mod install;
 mod oauth;
 mod open_cloud;
+mod policy;
 mod rbx_studio_server;
+mod secret_store;
 mod token_store;
 
 use oauth::OAuthConfig;
