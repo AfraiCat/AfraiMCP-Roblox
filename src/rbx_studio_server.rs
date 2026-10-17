@@ -111,8 +111,30 @@ impl Drop for OutputMapGuard {
         });
     }
 }
+/// Which tool set this process serves (`--mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServerMode {
+    /// Studio plugin tools plus the Open Cloud tools (the original behaviour).
+    #[default]
+    Studio,
+    /// Only the Open Cloud tools: no Studio plugin port and no plugin server.
+    Cloud,
+}
+
+/// Tools that need no Studio plugin and stay available in `ServerMode::Cloud`.
+/// Everything else is removed from the tool router in that mode.
+pub const CLOUD_TOOLS: [&str; 6] = [
+    "roblox_login",
+    "roblox_logout",
+    "upload_asset",
+    "update_asset",
+    "get_asset_info",
+    "list_my_assets",
+];
+
 #[derive(Clone)]
 pub struct RBXStudioServer {
+    mode: ServerMode,
     state: PackedState,
     /// Shared token cache for OAuth-backed tools. Always present; if OAuth
     /// env vars aren't set the tools that need them return a helpful error
@@ -127,6 +149,31 @@ pub struct RBXStudioServer {
 #[tool_handler]
 impl ServerHandler for RBXStudioServer {
     fn get_info(&self) -> ServerInfo {
+        if self.mode == ServerMode::Cloud {
+            return ServerInfo {
+                protocol_version: ProtocolVersion::LATEST,
+                capabilities: ServerCapabilities::builder().enable_tools().build(),
+                server_info: Implementation {
+                    name: "Roblox_Cloud".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    title: Some("Roblox Cloud MCP Server (Custom Fork)".to_string()),
+                    icons: None,
+                    website_url: None,
+                },
+                instructions: Some(
+                    "Open Cloud asset tools only; there is no Roblox Studio connection in this mode. \
+Only upload when the user asked for it in this conversation, and ask where to upload \
+(personal account or a group) unless they already said.
+- roblox_login: First-time / re-auth. Opens a browser tab.
+- roblox_logout: Clear locally stored tokens.
+- upload_asset: Upload a local file to the user's account.
+- update_asset: Replace contents of an existing asset by ID.
+- get_asset_info: Read asset metadata by ID.
+- list_my_assets: Page through the logged-in user's inventory."
+                        .to_string(),
+                ),
+            };
+        }
         ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -411,12 +458,24 @@ impl RBXStudioServer {
         state: PackedState,
         token_cache: Arc<TokenCache>,
         oauth_config: Option<OAuthConfig>,
+        mode: ServerMode,
     ) -> Self {
+        let mut tool_router = Self::tool_router();
+        if mode == ServerMode::Cloud {
+            // Removing the routes (not just hiding them in the list) also makes
+            // call_tool refuse the Studio tools in cloud mode.
+            for tool in tool_router.list_all() {
+                if !CLOUD_TOOLS.contains(&tool.name.as_ref()) {
+                    tool_router.remove_route(&tool.name);
+                }
+            }
+        }
         Self {
+            mode,
             state,
             token_cache,
             oauth_config,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -1027,5 +1086,91 @@ pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>) {
             tracing::debug!("dud_proxy_loop: waiter closed, exiting");
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Tools that need the Studio plugin. Studio mode must keep serving exactly
+    /// these plus `CLOUD_TOOLS`; a new tool has to be added here on purpose.
+    const STUDIO_ONLY_TOOLS: [&str; 17] = [
+        "batch_apply",
+        "clear_console",
+        "get_asset_ids",
+        "get_console_output",
+        "get_instance_tree",
+        "get_properties",
+        "get_studio_mode",
+        "insert_model",
+        "mock_datastore",
+        "open_script",
+        "read_datastore",
+        "rojo_build",
+        "rojo_sourcemap",
+        "run_code",
+        "run_script_in_play_mode",
+        "select_instances",
+        "start_stop_play",
+    ];
+
+    fn server(mode: ServerMode) -> RBXStudioServer {
+        RBXStudioServer::new(
+            Arc::new(Mutex::new(AppState::new())),
+            Arc::new(TokenCache::new()),
+            None,
+            mode,
+        )
+    }
+
+    fn tool_names(server: &RBXStudioServer) -> BTreeSet<String> {
+        server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_mode_is_studio() {
+        assert_eq!(ServerMode::default(), ServerMode::Studio);
+    }
+
+    #[test]
+    fn studio_mode_lists_every_tool() {
+        let mut expected = names(&STUDIO_ONLY_TOOLS);
+        expected.extend(names(&CLOUD_TOOLS));
+        assert_eq!(tool_names(&server(ServerMode::Studio)), expected);
+    }
+
+    #[test]
+    fn cloud_mode_lists_only_the_cloud_tools() {
+        assert_eq!(tool_names(&server(ServerMode::Cloud)), names(&CLOUD_TOOLS));
+    }
+
+    #[test]
+    fn cloud_mode_removes_the_studio_routes() {
+        let cloud = server(ServerMode::Cloud);
+        for tool in STUDIO_ONLY_TOOLS {
+            assert!(!cloud.tool_router.has_route(tool), "{tool} still routable");
+        }
+        for tool in CLOUD_TOOLS {
+            assert!(cloud.tool_router.has_route(tool), "{tool} missing");
+        }
+    }
+
+    #[test]
+    fn cloud_mode_identifies_itself_as_cloud() {
+        let info = server(ServerMode::Cloud).get_info();
+        assert_eq!(info.server_info.name, "Roblox_Cloud");
+        let studio = server(ServerMode::Studio).get_info();
+        assert_eq!(studio.server_info.name, "Roblox_Studio");
     }
 }
