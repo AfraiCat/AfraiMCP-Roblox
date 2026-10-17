@@ -9,6 +9,7 @@ local function handleClearConsole(): string?
 		LogService:ClearOutput()
 	end)
 	ConsoleOutput.outputMessage = ""
+	ConsoleOutput.truncated = false
 	return "Console cleared"
 end
 

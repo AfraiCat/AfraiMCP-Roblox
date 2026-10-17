@@ -97,8 +97,10 @@ local function runCodeWithOutput(command: string): string
 
 		local oldError = error
 		chunkfenv.error = function(...)
-			oldError(...)
+			-- Capture first, then throw. Previous order never reached the
+			-- addToOutput call because oldError raises immediately.
 			addToOutput("[ERROR]", ...)
+			oldError(...)
 		end
 
 		local results = table.pack(chunk())

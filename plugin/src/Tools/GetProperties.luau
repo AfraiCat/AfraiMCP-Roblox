@@ -1,4 +1,5 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
+local PathResolver = require(Main.Utils.PathResolver)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
@@ -31,29 +32,6 @@ local function serializeValue(value: any): any
 	else
 		return tostring(value)
 	end
-end
-
-local function resolvePath(path: string): Instance
-	if path == "" or path == "game" or path == "Game" then
-		return game
-	end
-
-	local parts = string.split(path, ".")
-	local current: Instance = game
-
-	for i, part in parts do
-		if i == 1 and (part == "game" or part == "Game") then
-			current = game
-		else
-			local child = current:FindFirstChild(part)
-			if not child then
-				error("Instance not found: " .. path)
-			end
-			current = child
-		end
-	end
-
-	return current
 end
 
 local function getInstanceProperties(instance: Instance, propertyNames: { string }?): { [string]: any }
@@ -108,9 +86,20 @@ local function handleGetProperties(args: Types.GetPropertiesArgs): string?
 	local instancePath = args.instancePath or "game"
 	local propertyNames = args.propertyNames
 
-	local instance = resolvePath(instancePath)
+	local instance = PathResolver.resolve(instancePath)
 	local properties = getInstanceProperties(instance, propertyNames)
-	return HttpService:JSONEncode(properties)
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(properties)
+	end)
+	if not ok then
+		return HttpService:JSONEncode({
+			_error = "json_encode_failed",
+			_reason = tostring(encoded),
+			Name = instance.Name,
+			ClassName = instance.ClassName,
+		})
+	end
+	return encoded
 end
 
 return handleGetProperties :: Types.ToolFunction

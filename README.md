@@ -51,6 +51,38 @@ The setup process also contains a small plugin installation and Claude Desktop c
 - **rojo_sourcemap** - Run `rojo sourcemap` for file-to-instance mapping (requires Rojo).
 - **rojo_build** - Run `rojo build` to validate/sync project (requires Rojo).
 
+**OAuth / Open Cloud tools (require setup, see below):**
+- **roblox_login** - One-time browser-based OAuth login. Stores tokens locally.
+- **roblox_logout** - Clear locally stored tokens.
+- **upload_asset** - Upload a local file (Decal/Audio/Model/Animation/Mesh/Video) to your Roblox account.
+- **update_asset** - Replace the contents of an existing asset by ID.
+- **get_asset_info** - Read asset metadata via the Open Cloud Assets API.
+- **list_my_assets** - Page through your inventory items via the v2 inventory endpoint.
+
+## OAuth setup (one-time)
+
+The Open Cloud tools above require a Roblox OAuth 2.0 application. The MCP itself never sees the client secret embedded in source — it reads two environment variables at startup and stores OAuth tokens locally per-user.
+
+1. Visit the [Creator Dashboard → Open Cloud → OAuth 2.0 Apps](https://create.roblox.com/dashboard/credentials) and create an app.
+2. Add **`http://localhost:44756/callback`** as a Redirect URI (the port is fixed; Roblox does not honor wildcard ports for native apps).
+3. Under Permissions, enable at minimum **`openid`**, **`profile`**, **`asset:read`**, **`asset:write`**, and **`user.inventory-item:read`** (for `list_my_assets`). You can enable more scopes if you plan to extend the MCP later.
+4. Copy the **Client ID** and **Client Secret**.
+5. Export them as environment variables in the same shell / launch profile that runs the MCP binary:
+   ```sh
+   export ROBLOX_OAUTH_CLIENT_ID=...
+   export ROBLOX_OAUTH_CLIENT_SECRET=...
+   ```
+   On Windows (PowerShell):
+   ```powershell
+   setx ROBLOX_OAUTH_CLIENT_ID "..."
+   setx ROBLOX_OAUTH_CLIENT_SECRET "..."
+   ```
+   For Claude Desktop and similar GUI clients, you'll need to launch them from a shell where these are set (macOS/Linux) or use `setx` (Windows) so they're inherited.
+6. Restart the MCP server, then ask the MCP `roblox_login`. A browser tab opens; authorize; you're done.
+7. Tokens are written to `~/.config/rbx-studio-mcp/oauth-tokens.json` (or the platform equivalent) with `0600` perms on Unix. Refresh happens automatically as long as the refresh token is valid.
+
+To revoke: run `roblox_logout` (clears local tokens) and/or revoke the app from the Creator Dashboard.
+
 ## Setup
 
 ### Install with release binaries

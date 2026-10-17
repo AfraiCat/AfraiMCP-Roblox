@@ -1,4 +1,5 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
+local PathResolver = require(Main.Utils.PathResolver)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
@@ -76,41 +77,17 @@ local function getAssetIdsFromInstance(instance: Instance, assetTypes: { string 
 	return results
 end
 
-local function resolvePath(path: string): Instance
-	if path == "" or path == "game" or path == "Game" then
-		return game
-	end
-
-	local parts = string.split(path, ".")
-	local current: Instance = game
-
-	for i, part in parts do
-		if i == 1 and (part == "game" or part == "Game") then
-			current = game
-		else
-			local child = current:FindFirstChild(part)
-			if not child then
-				error("Instance not found: " .. path)
-			end
-			current = child
-		end
-	end
-
-	return current
-end
-
 local function handleGetAssetIds(args: Types.GetAssetIdsArgs): string?
 	local rootPath = if args.rootPath and args.rootPath ~= "" then args.rootPath else "game"
 	local assetTypes = args.assetTypes
 
-	local rootInstance = resolvePath(rootPath)
+	local rootInstance = PathResolver.resolve(rootPath)
 	local allAssets = {}
 
-	local toSearch = { rootInstance }
-	if rootInstance == game then
-		toSearch = game:GetDescendants()
-		table.insert(toSearch, 1, game)
-	end
+	-- Always descend. Previously this only happened when rootInstance == game,
+	-- which meant narrower rootPaths returned essentially nothing.
+	local toSearch = rootInstance:GetDescendants()
+	table.insert(toSearch, 1, rootInstance)
 
 	local truncated = false
 	for _, instance in toSearch do

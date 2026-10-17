@@ -41,6 +41,18 @@ local function log(...)
 	end
 end
 
+-- Read-only tools don't need to create undo-history entries. Wrapping them
+-- in ChangeHistoryService would produce bogus undo steps and also risks
+-- "Previous recording not finished" warnings when requests overlap.
+local READ_ONLY_TOOLS: { [string]: true } = {
+	GetConsoleOutput = true,
+	GetStudioMode = true,
+	GetInstanceTree = true,
+	GetProperties = true,
+	GetAssetIds = true,
+	ReadDataStore = true,
+}
+
 local function toolCallHandler(args: Types.ToolArgs): string
 	local toolName = next(args)
 	if not toolName then
@@ -52,10 +64,20 @@ local function toolCallHandler(args: Types.ToolArgs): string
 		error("Invalid tool args found for tool name: " .. toolName)
 	end
 
-	local recording = ChangeHistoryService:TryBeginRecording("StudioMCP")
+	local isReadOnly = READ_ONLY_TOOLS[toolName] == true
+	-- Unique recording name so overlapping write tools don't collide.
+	local recording = if isReadOnly
+		then nil
+		else ChangeHistoryService:TryBeginRecording("StudioMCP:" .. toolName .. ":" .. HttpService:GenerateGUID(false))
+
 	local success, response = pcall(ToolDispatcher.dispatchTool, toolName, toolArgs)
 	if recording then
-		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		ChangeHistoryService:FinishRecording(
+			recording,
+			if success
+				then Enum.FinishRecordingOperation.Commit
+				else Enum.FinishRecordingOperation.Cancel
+		)
 	end
 
 	if success then
@@ -80,29 +102,39 @@ local function connectWebSocket()
 	client.MessageReceived:Connect(function(message)
 		log("[MCP] Message received")
 
-		local body = HttpService:JSONDecode(message)
-		assert(body and body.id and body.args, "Invalid message received")
+		local ok, body = pcall(HttpService.JSONDecode, HttpService, message)
+		if not ok or not body or not body.id or not body.args then
+			log("[MCP] Invalid message received:", message)
+			return
+		end
 
 		local id: string = body.id
-		local responseSent = false
-		local function sendResponseOnce(success: boolean, response: string)
-			if not responseSent then
-				log("[MCP] Sending response:", response)
+		local args: Types.ToolArgs = body.args
+
+		-- Run each request on its own coroutine so the HTTP poll loop can
+		-- return and pick up the next request immediately. Previously, a
+		-- single slow tool (play mode, deep tree walk, ExecutePlayModeAsync)
+		-- would stall the poll loop and force every other tool to wait.
+		task.spawn(function()
+			local responseSent = false
+			local function sendResponseOnce(success: boolean, response: string)
+				if responseSent then
+					return
+				end
 				responseSent = true
+				log("[MCP] Sending response:", response)
 				client:Send({
 					id = id,
 					success = success,
 					response = response,
 				})
 			end
-		end
 
-		local args: Types.ToolArgs = body.args
+			local success, response = pcall(toolCallHandler, args)
+			sendResponseOnce(success, tostring(response))
 
-		local success, response = pcall(toolCallHandler, args)
-		sendResponseOnce(success, response)
-
-		log("[MCP] Successfully handled request")
+			log("[MCP] Successfully handled request")
+		end)
 	end)
 
 	return client

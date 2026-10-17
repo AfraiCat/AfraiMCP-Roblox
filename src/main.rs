@@ -10,7 +10,13 @@ use tokio::sync::Mutex;
 use tracing_subscriber::{self, EnvFilter};
 mod error;
 mod install;
+mod oauth;
+mod open_cloud;
 mod rbx_studio_server;
+mod token_store;
+
+use oauth::OAuthConfig;
+use token_store::TokenCache;
 
 /// Simple MCP proxy for Roblox Studio
 /// Run without arguments to install the plugin
@@ -69,8 +75,23 @@ async fn main() -> Result<()> {
         })
     };
 
+    // OAuth config is optional — env vars are only needed for the upload /
+    // asset-management tools. Missing env vars simply means those tools
+    // return a "set these env vars and restart" error.
+    let oauth_config = OAuthConfig::from_env();
+    if oauth_config.is_some() {
+        tracing::info!(
+            "OAuth env vars detected. Open Cloud tools (upload_asset, etc.) are available."
+        );
+    } else {
+        tracing::info!(
+            "ROBLOX_OAUTH_CLIENT_ID / ROBLOX_OAUTH_CLIENT_SECRET not set; Open Cloud tools disabled."
+        );
+    }
+    let token_cache = Arc::new(TokenCache::new());
+
     // Create an instance of our counter router
-    let service = RBXStudioServer::new(Arc::clone(&server_state))
+    let service = RBXStudioServer::new(Arc::clone(&server_state), token_cache, oauth_config)
         .serve(rmcp::transport::stdio())
         .await
         .inspect_err(|e| {
