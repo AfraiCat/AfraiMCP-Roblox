@@ -40,5 +40,5 @@ rojo = "7.6.1"
 
 [package.metadata.bundle]
 name = "RobloxStudioMCP"
-description = "Model Context Protocol server for Roblox Studio"
+short_description = "Model Context Protocol server for Roblox Studio"
 identifier = "com.rbx-mcp.server"
