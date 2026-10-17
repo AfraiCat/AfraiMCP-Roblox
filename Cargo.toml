@@ -27,7 +27,6 @@ base64 = "0.22"
 rand = "0.8"
 dirs = "5"
 open = "5"
-mime_guess = "2"
 urlencoding = "2"
 time = { version = "0.3", features = ["serde", "macros"] }
 

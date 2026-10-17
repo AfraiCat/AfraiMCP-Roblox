@@ -166,8 +166,8 @@ Only upload when the user asked for it in this conversation, and ask where to up
 (personal account or a group) unless they already said.
 - roblox_login: First-time / re-auth. Opens a browser tab.
 - roblox_logout: Clear locally stored tokens.
-- upload_asset: Upload a local file to the user's account.
-- update_asset: Replace contents of an existing asset by ID.
+- upload_asset: Upload a local file (Animation/Audio/Decal/Image/Mesh/Model/Video) to the user's account.
+- update_asset: Replace the contents of an existing asset by ID (.fbx files only).
 - get_asset_info: Read asset metadata by ID.
 - list_my_assets: Page through the logged-in user's inventory."
                         .to_string(),
@@ -200,8 +200,8 @@ Rojo tools (rojo_sourcemap, rojo_build) run on host; require Rojo installed.
 OAuth-backed Open Cloud tools (require ROBLOX_OAUTH_CLIENT_ID / ROBLOX_OAUTH_CLIENT_SECRET env vars and a one-time roblox_login):
 - roblox_login: First-time / re-auth. Opens a browser tab.
 - roblox_logout: Revoke locally stored tokens.
-- upload_asset: Upload a local file (Decal/Audio/Model/etc.) to the user's account.
-- update_asset: Replace contents of an existing asset by ID.
+- upload_asset: Upload a local file (Animation/Audio/Decal/Image/Mesh/Model/Video) to the user's account.
+- update_asset: Replace the contents of an existing asset by ID (.fbx files only).
 - get_asset_info: Read asset metadata by ID.
 - list_my_assets: Page through the logged-in user's inventory.
 These tools live in the Rust process and do not require Roblox Studio to be running."
@@ -355,7 +355,7 @@ struct UploadAsset {
     file_path: String,
     #[serde(rename = "assetType")]
     #[schemars(
-        description = "One of: Decal, Audio, Model, ModelFromFbx, MeshPart, Animation, Video"
+        description = "One of: Animation, Audio, Decal, Image, Mesh, Model, Video (case-insensitive). The file extension must match the type and the file content is checked: Model .fbx/.gltf/.glb/.rbxm/.rbxmx; Image and Decal .png/.jpg/.jpeg/.bmp/.tga; Audio .mp3/.ogg/.wav/.flac; Animation .rbxm/.rbxmx; Video .mp4/.mov; Mesh takes Roblox-format data only (upload .fbx/.glb as Model)"
     )]
     asset_type: String,
     #[serde(rename = "displayName")]
@@ -382,7 +382,7 @@ struct UpdateAsset {
     #[schemars(description = "ID of the existing asset to update")]
     asset_id: String,
     #[serde(rename = "filePath")]
-    #[schemars(description = "Absolute path to the new local file. Max 20MB.")]
+    #[schemars(description = "Absolute path to the new local .fbx file. Max 20MB.")]
     file_path: String,
 }
 
@@ -736,7 +736,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Upload a local file to Roblox as a new asset under the logged-in user's account. Returns the resolved asset metadata including assetId on success."
+        description = "Upload a local file to Roblox as a new asset under the logged-in user's account. assetType is one of Animation, Audio, Decal, Image, Mesh, Model, Video; the file extension and content must match it (see assetType). Returns the resolved asset metadata including assetId on success."
     )]
     async fn upload_asset(
         &self,
@@ -763,7 +763,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Replace the contents of an existing asset (by assetId) with the bytes of a local file. The asset type stays the same. Returns the updated asset metadata."
+        description = "Replace the contents of an existing asset (by assetId) with the bytes of a local .fbx file; Roblox currently supports content updates for .fbx only. The asset type stays the same. Returns the updated asset metadata."
     )]
     async fn update_asset(
         &self,
@@ -1163,6 +1163,32 @@ mod tests {
         }
         for tool in CLOUD_TOOLS {
             assert!(cloud.tool_router.has_route(tool), "{tool} missing");
+        }
+    }
+
+    #[test]
+    fn upload_tool_text_lists_the_real_asset_types_only() {
+        use crate::asset_types::AssetKind;
+        for mode in [ServerMode::Studio, ServerMode::Cloud] {
+            let s = server(mode);
+            for name in ["upload_asset", "update_asset"] {
+                let tool = s
+                    .tool_router
+                    .list_all()
+                    .into_iter()
+                    .find(|t| t.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing"));
+                let text = serde_json::to_string(&tool).unwrap();
+                assert!(!text.contains("ModelFromFbx"), "{name}: {text}");
+                assert!(!text.contains("MeshPart"), "{name}: {text}");
+                if name == "upload_asset" {
+                    for kind in AssetKind::ALL {
+                        assert!(text.contains(kind.api_name()), "{name} lacks {kind}");
+                    }
+                }
+            }
+            let info = serde_json::to_string(&s.get_info()).unwrap();
+            assert!(!info.contains("ModelFromFbx"), "{info}");
         }
     }
 

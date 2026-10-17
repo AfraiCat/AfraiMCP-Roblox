@@ -5,6 +5,7 @@
 //! are not always self-explanatory) and to handle the asynchronous upload
 //! pattern: POST kicks off an operation, then we poll for completion.
 
+use crate::asset_types::{self, AssetKind, ValidatedFile};
 use crate::oauth::{ensure_access_token, OAuthConfig};
 use crate::token_store::TokenCache;
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -16,21 +17,6 @@ use tokio::time::sleep;
 
 const ASSETS_BASE: &str = "https://apis.roblox.com/assets/v1";
 const CLOUD_V2_BASE: &str = "https://apis.roblox.com/cloud/v2";
-
-const UPLOAD_MAX_BYTES: u64 = 20 * 1024 * 1024; // Roblox's documented 20MB cap
-
-/// Asset types accepted by the upload endpoint. We accept a string from the
-/// caller and validate against this list rather than expose an enum, so the
-/// MCP tool description can include the full list in plain text.
-const VALID_ASSET_TYPES: &[&str] = &[
-    "Decal",
-    "Audio",
-    "Model",
-    "ModelFromFbx",
-    "MeshPart",
-    "Animation",
-    "Video",
-];
 
 #[derive(Debug, Serialize)]
 struct Creator {
@@ -102,19 +88,12 @@ impl OpenCloudClient {
     /// completes (or `poll_timeout` elapses), returning the new asset
     /// metadata.
     pub async fn upload_asset(&self, args: UploadArgs) -> Result<serde_json::Value> {
-        validate_asset_type(&args.asset_type)?;
+        let kind = AssetKind::parse(&args.asset_type)?;
         let path = PathBuf::from(&args.file_path);
         let file_meta = tokio::fs::metadata(&path)
             .await
             .wrap_err_with(|| format!("Reading file metadata for {}", path.display()))?;
-        if file_meta.len() > UPLOAD_MAX_BYTES {
-            return Err(eyre!(
-                "{} is {} bytes; Roblox's upload limit is {} bytes (20 MB)",
-                path.display(),
-                file_meta.len(),
-                UPLOAD_MAX_BYTES
-            ));
-        }
+        asset_types::validate_size(kind, file_meta.len())?;
 
         let creator = match (args.group_id.as_deref(), args.user_id.as_deref()) {
             (Some(_), Some(_)) => {
@@ -138,7 +117,7 @@ impl OpenCloudClient {
         };
 
         let request_json = serde_json::to_string(&UploadRequest {
-            asset_type: args.asset_type.clone(),
+            asset_type: kind.api_name().to_string(),
             display_name: args.display_name.clone(),
             description: args.description.clone().unwrap_or_default(),
             creation_context: CreationContext { creator },
@@ -147,21 +126,13 @@ impl OpenCloudClient {
         let bytes = tokio::fs::read(&path)
             .await
             .wrap_err_with(|| format!("Reading file {}", path.display()))?;
-        let mime = mime_guess::from_path(&path).first_or_octet_stream();
-        let file_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "asset".to_string());
+        let file = asset_types::validate_upload(kind, &path.to_string_lossy(), &bytes)?;
 
         // Roblox's multipart form expects exactly two fields: "request" (JSON
         // metadata as a plain text part) and "fileContent" (the file).
-        let form = multipart::Form::new().text("request", request_json).part(
-            "fileContent",
-            multipart::Part::bytes(bytes)
-                .file_name(file_name)
-                .mime_str(mime.essence_str())
-                .wrap_err("Building multipart file part")?,
-        );
+        let form = multipart::Form::new()
+            .text("request", request_json)
+            .part("fileContent", file_part(&file, bytes)?);
 
         let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets");
@@ -198,33 +169,18 @@ impl OpenCloudClient {
         let meta = tokio::fs::metadata(file_path)
             .await
             .wrap_err_with(|| format!("Reading file metadata for {}", file_path.display()))?;
-        if meta.len() > UPLOAD_MAX_BYTES {
-            return Err(eyre!(
-                "{} is {} bytes; Roblox's upload limit is {} bytes (20 MB)",
-                file_path.display(),
-                meta.len(),
-                UPLOAD_MAX_BYTES
-            ));
-        }
+        asset_types::validate_size(AssetKind::Model, meta.len())?;
         let bytes = tokio::fs::read(file_path)
             .await
             .wrap_err_with(|| format!("Reading file {}", file_path.display()))?;
-        let mime = mime_guess::from_path(file_path).first_or_octet_stream();
-        let file_name = file_path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "asset".to_string());
+        let file = asset_types::validate_content_update(&file_path.to_string_lossy(), &bytes)?;
 
         // Per the Roblox docs, content updates use the same multipart shape
         // (just no creationContext) against PATCH /assets/{id}.
         let request_json = serde_json::json!({}).to_string();
-        let form = multipart::Form::new().text("request", request_json).part(
-            "fileContent",
-            multipart::Part::bytes(bytes)
-                .file_name(file_name)
-                .mime_str(mime.essence_str())
-                .wrap_err("Building multipart file part")?,
-        );
+        let form = multipart::Form::new()
+            .text("request", request_json)
+            .part("fileContent", file_part(&file, bytes)?);
 
         let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets/{asset_id}");
@@ -358,15 +314,13 @@ impl OpenCloudClient {
     }
 }
 
-fn validate_asset_type(t: &str) -> Result<()> {
-    if VALID_ASSET_TYPES.iter().any(|v| v.eq_ignore_ascii_case(t)) {
-        Ok(())
-    } else {
-        Err(eyre!(
-            "Invalid asset_type '{t}'. Expected one of: {}",
-            VALID_ASSET_TYPES.join(", ")
-        ))
-    }
+/// Build the `fileContent` multipart part with the explicit content type from
+/// the validated format (never guessed from the file name).
+fn file_part(file: &ValidatedFile, bytes: Vec<u8>) -> Result<multipart::Part> {
+    multipart::Part::bytes(bytes)
+        .file_name(file.file_name.clone())
+        .mime_str(file.content_type)
+        .wrap_err("Building multipart file part")
 }
 
 pub struct UploadArgs {
