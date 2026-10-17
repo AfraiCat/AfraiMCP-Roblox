@@ -6,8 +6,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
 use color_eyre::eyre::{eyre, Error, OptionExt};
-use std::path::PathBuf;
-use tokio::process::Command;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -17,7 +15,9 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
@@ -206,10 +206,14 @@ struct RunScriptInPlayMode {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct GetInstanceTree {
     #[serde(rename = "rootPath")]
-    #[schemars(description = "Root path (e.g. 'game', 'Workspace', 'Workspace.Model'). Default: game")]
+    #[schemars(
+        description = "Root path (e.g. 'game', 'Workspace', 'Workspace.Model'). Default: game"
+    )]
     root_path: Option<String>,
     #[serde(rename = "maxDepth")]
-    #[schemars(description = "Max depth for tree traversal. Default: 3, max: 5. Use narrower rootPath (e.g. Workspace.MyModel) for deeper trees.")]
+    #[schemars(
+        description = "Max depth for tree traversal. Default: 3, max: 5. Use narrower rootPath (e.g. Workspace.MyModel) for deeper trees."
+    )]
     max_depth: Option<u32>,
 }
 
@@ -219,7 +223,9 @@ struct GetProperties {
     #[schemars(description = "Instance path (e.g. 'Workspace.Part', 'game.Lighting')")]
     instance_path: String,
     #[serde(rename = "propertyNames")]
-    #[schemars(description = "Optional list of property names to fetch. If omitted, returns common properties")]
+    #[schemars(
+        description = "Optional list of property names to fetch. If omitted, returns common properties"
+    )]
     property_names: Option<Vec<String>>,
 }
 
@@ -233,7 +239,9 @@ struct BatchApply {
     selector_value: String,
     #[schemars(description = "Property to set (e.g. Color, Position, Size)")]
     property: String,
-    #[schemars(description = "Value to set. For Color use [r,g,b] 0-1. For Position/Size use [x,y,z]")]
+    #[schemars(
+        description = "Value to set. For Color use [r,g,b] 0-1. For Position/Size use [x,y,z]"
+    )]
     value: serde_json::Value,
 }
 
@@ -299,7 +307,9 @@ struct UploadAsset {
     #[schemars(description = "Absolute path to the local file to upload. Max 20MB.")]
     file_path: String,
     #[serde(rename = "assetType")]
-    #[schemars(description = "One of: Decal, Audio, Model, ModelFromFbx, MeshPart, Animation, Video")]
+    #[schemars(
+        description = "One of: Decal, Audio, Model, ModelFromFbx, MeshPart, Animation, Video"
+    )]
     asset_type: String,
     #[serde(rename = "displayName")]
     #[schemars(description = "Display name shown on the Roblox catalog page")]
@@ -308,10 +318,14 @@ struct UploadAsset {
     description: Option<String>,
     /// Override the creator. Defaults to the logged-in user.
     #[serde(rename = "userId")]
-    #[schemars(description = "Optional override: upload under this user ID (defaults to current user)")]
+    #[schemars(
+        description = "Optional override: upload under this user ID (defaults to current user)"
+    )]
     user_id: Option<String>,
     #[serde(rename = "groupId")]
-    #[schemars(description = "Optional override: upload under this group ID. Mutually exclusive with userId.")]
+    #[schemars(
+        description = "Optional override: upload under this group ID. Mutually exclusive with userId."
+    )]
     group_id: Option<String>,
 }
 
@@ -335,7 +349,9 @@ struct GetAssetInfo {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct ListMyAssets {
     #[serde(rename = "userId")]
-    #[schemars(description = "Optional: fetch a different user's inventory. Defaults to the logged-in user.")]
+    #[schemars(
+        description = "Optional: fetch a different user's inventory. Defaults to the logged-in user."
+    )]
     user_id: Option<String>,
     #[serde(rename = "pageSize")]
     #[schemars(description = "Items per page (1-100). Defaults to Roblox's default.")]
@@ -343,7 +359,9 @@ struct ListMyAssets {
     #[serde(rename = "pageToken")]
     #[schemars(description = "Pagination cursor returned by a previous call")]
     page_token: Option<String>,
-    #[schemars(description = "Inventory filter, e.g. 'assetIds=1,2,3' or 'inventoryItemAssetTypes=DECAL'")]
+    #[schemars(
+        description = "Inventory filter, e.g. 'assetIds=1,2,3' or 'inventoryItemAssetTypes=DECAL'"
+    )]
     filter: Option<String>,
 }
 
@@ -351,7 +369,9 @@ struct ListMyAssets {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RojoSourcemap {
     #[serde(rename = "projectPath")]
-    #[schemars(description = "Path to Rojo project (default.project.json) or directory. Default: current workspace")]
+    #[schemars(
+        description = "Path to Rojo project (default.project.json) or directory. Default: current workspace"
+    )]
     project_path: Option<String>,
 }
 
@@ -692,10 +712,7 @@ impl RBXStudioServer {
     ) -> Result<CallToolResult, ErrorData> {
         let client = self.open_cloud()?;
         let path = std::path::PathBuf::from(&args.file_path);
-        match client
-            .update_asset_content(&args.asset_id, &path, 60)
-            .await
-        {
+        match client.update_asset_content(&args.asset_id, &path, 60).await {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
             )])),
@@ -705,9 +722,7 @@ impl RBXStudioServer {
         }
     }
 
-    #[tool(
-        description = "Get metadata for a Roblox asset by ID via the Open Cloud Assets API."
-    )]
+    #[tool(description = "Get metadata for a Roblox asset by ID via the Open Cloud Assets API.")]
     async fn get_asset_info(
         &self,
         Parameters(args): Parameters<GetAssetInfo>,
@@ -811,18 +826,13 @@ impl RBXStudioServer {
                 tracing::debug!("Sending to MCP: {result:?}");
                 match result {
                     Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-                    Err(err) => {
-                        Ok(CallToolResult::error(vec![Content::text(err.to_string())]))
-                    }
+                    Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
                 }
             }
         }
     }
 
-    async fn run_rojo_sourcemap(
-        &self,
-        args: RojoSourcemap,
-    ) -> Result<CallToolResult, ErrorData> {
+    async fn run_rojo_sourcemap(&self, args: RojoSourcemap) -> Result<CallToolResult, ErrorData> {
         let project_path = args
             .project_path
             .map(PathBuf::from)

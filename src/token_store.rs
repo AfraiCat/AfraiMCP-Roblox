@@ -41,8 +41,8 @@ impl StoredTokens {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| eyre!("Could not determine OS config directory"))?;
+    let base =
+        dirs::config_dir().ok_or_else(|| eyre!("Could not determine OS config directory"))?;
     Ok(base.join(APP_DIR))
 }
 
@@ -57,8 +57,8 @@ pub fn load() -> Result<Option<StoredTokens>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(&path)
-        .wrap_err_with(|| format!("Reading token file at {}", path.display()))?;
+    let bytes =
+        fs::read(&path).wrap_err_with(|| format!("Reading token file at {}", path.display()))?;
     let tokens: StoredTokens = serde_json::from_slice(&bytes)
         .wrap_err_with(|| format!("Parsing token file at {}", path.display()))?;
     Ok(Some(tokens))
@@ -68,8 +68,7 @@ pub fn load() -> Result<Option<StoredTokens>> {
 /// can't leave a half-written file that fails to parse.
 pub fn save(tokens: &StoredTokens) -> Result<()> {
     let dir = config_dir()?;
-    fs::create_dir_all(&dir)
-        .wrap_err_with(|| format!("Creating config dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).wrap_err_with(|| format!("Creating config dir {}", dir.display()))?;
     let final_path = dir.join(TOKEN_FILE);
     let tmp_path = dir.join(format!("{TOKEN_FILE}.tmp"));
 

@@ -104,7 +104,10 @@ fn generate_pkce() -> PkcePair {
     hasher.update(verifier.as_bytes());
     let digest = hasher.finalize();
     let challenge = URL_SAFE_NO_PAD.encode(digest);
-    PkcePair { verifier, challenge }
+    PkcePair {
+        verifier,
+        challenge,
+    }
 }
 
 fn random_state() -> String {
@@ -177,7 +180,9 @@ async fn await_callback() -> Result<CallbackResult> {
             Some(kv) => kv,
             None => continue,
         };
-        let decoded = urlencoding::decode(v).map(|s| s.into_owned()).unwrap_or_default();
+        let decoded = urlencoding::decode(v)
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
         match k {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
@@ -256,8 +261,8 @@ async fn exchange_code(
              Dashboard."
         ));
     }
-    let parsed: TokenResponse = serde_json::from_str(&body)
-        .wrap_err_with(|| format!("Parsing token response: {body}"))?;
+    let parsed: TokenResponse =
+        serde_json::from_str(&body).wrap_err_with(|| format!("Parsing token response: {body}"))?;
 
     let expires_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -328,9 +333,9 @@ pub async fn login(cache: Arc<TokenCache>, config: &OAuthConfig) -> Result<Store
     if let Some(err) = callback.error {
         return Err(eyre!("Roblox returned an OAuth error: {err}"));
     }
-    let code = callback.code.ok_or_else(|| {
-        eyre!("OAuth callback did not include an authorization code")
-    })?;
+    let code = callback
+        .code
+        .ok_or_else(|| eyre!("OAuth callback did not include an authorization code"))?;
     let returned_state = callback.state.unwrap_or_default();
     if returned_state != state {
         return Err(eyre!(
@@ -370,10 +375,7 @@ async fn refresh(
 /// Get a valid access token, refreshing on demand. Returns an error if no
 /// tokens are stored (user hasn't logged in) or if refresh fails (the user
 /// needs to re-authorize).
-pub async fn ensure_access_token(
-    cache: &TokenCache,
-    config: &OAuthConfig,
-) -> Result<StoredTokens> {
+pub async fn ensure_access_token(cache: &TokenCache, config: &OAuthConfig) -> Result<StoredTokens> {
     let tokens = cache
         .get()
         .await?

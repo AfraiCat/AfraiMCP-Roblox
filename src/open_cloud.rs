@@ -104,9 +104,9 @@ impl OpenCloudClient {
     pub async fn upload_asset(&self, args: UploadArgs) -> Result<serde_json::Value> {
         validate_asset_type(&args.asset_type)?;
         let path = PathBuf::from(&args.file_path);
-        let file_meta = tokio::fs::metadata(&path).await.wrap_err_with(|| {
-            format!("Reading file metadata for {}", path.display())
-        })?;
+        let file_meta = tokio::fs::metadata(&path)
+            .await
+            .wrap_err_with(|| format!("Reading file metadata for {}", path.display()))?;
         if file_meta.len() > UPLOAD_MAX_BYTES {
             return Err(eyre!(
                 "{} is {} bytes; Roblox's upload limit is {} bytes (20 MB)",
@@ -155,15 +155,13 @@ impl OpenCloudClient {
 
         // Roblox's multipart form expects exactly two fields: "request" (JSON
         // metadata as a plain text part) and "fileContent" (the file).
-        let form = multipart::Form::new()
-            .text("request", request_json)
-            .part(
-                "fileContent",
-                multipart::Part::bytes(bytes)
-                    .file_name(file_name)
-                    .mime_str(mime.essence_str())
-                    .wrap_err("Building multipart file part")?,
-            );
+        let form = multipart::Form::new().text("request", request_json).part(
+            "fileContent",
+            multipart::Part::bytes(bytes)
+                .file_name(file_name)
+                .mime_str(mime.essence_str())
+                .wrap_err("Building multipart file part")?,
+        );
 
         let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets");
@@ -197,9 +195,9 @@ impl OpenCloudClient {
         file_path: &Path,
         poll_timeout_secs: u64,
     ) -> Result<serde_json::Value> {
-        let meta = tokio::fs::metadata(file_path).await.wrap_err_with(|| {
-            format!("Reading file metadata for {}", file_path.display())
-        })?;
+        let meta = tokio::fs::metadata(file_path)
+            .await
+            .wrap_err_with(|| format!("Reading file metadata for {}", file_path.display()))?;
         if meta.len() > UPLOAD_MAX_BYTES {
             return Err(eyre!(
                 "{} is {} bytes; Roblox's upload limit is {} bytes (20 MB)",
@@ -208,9 +206,9 @@ impl OpenCloudClient {
                 UPLOAD_MAX_BYTES
             ));
         }
-        let bytes = tokio::fs::read(file_path).await.wrap_err_with(|| {
-            format!("Reading file {}", file_path.display())
-        })?;
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .wrap_err_with(|| format!("Reading file {}", file_path.display()))?;
         let mime = mime_guess::from_path(file_path).first_or_octet_stream();
         let file_name = file_path
             .file_name()
@@ -220,15 +218,13 @@ impl OpenCloudClient {
         // Per the Roblox docs, content updates use the same multipart shape
         // (just no creationContext) against PATCH /assets/{id}.
         let request_json = serde_json::json!({}).to_string();
-        let form = multipart::Form::new()
-            .text("request", request_json)
-            .part(
-                "fileContent",
-                multipart::Part::bytes(bytes)
-                    .file_name(file_name)
-                    .mime_str(mime.essence_str())
-                    .wrap_err("Building multipart file part")?,
-            );
+        let form = multipart::Form::new().text("request", request_json).part(
+            "fileContent",
+            multipart::Part::bytes(bytes)
+                .file_name(file_name)
+                .mime_str(mime.essence_str())
+                .wrap_err("Building multipart file part")?,
+        );
 
         let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets/{asset_id}");
@@ -275,9 +271,7 @@ impl OpenCloudClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
-                return Err(eyre!(
-                    "Polling operation failed ({status}): {body}"
-                ));
+                return Err(eyre!("Polling operation failed ({status}): {body}"));
             }
             let op: OperationResponse = serde_json::from_str(&body)
                 .wrap_err_with(|| format!("Parsing operation poll response: {body}"))?;
