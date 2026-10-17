@@ -103,7 +103,9 @@ local function handleBatchApply(args: Types.BatchApplyArgs): string?
 		modified = modified,
 		total = #instances,
 		truncated = truncated,
-		_hint = if truncated then "Hit " .. MAX_CLASSNAME_MATCHES .. " match cap for className selector; narrow the search" else nil,
+		_hint = if truncated
+			then "Hit " .. MAX_CLASSNAME_MATCHES .. " match cap for className selector; narrow the search"
+			else nil,
 		errors = errors,
 	})
 end

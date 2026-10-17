@@ -59,21 +59,36 @@ local function getInstanceProperties(instance: Instance, propertyNames: { string
 	-- Get specific properties or all common ones
 	if propertyNames and #propertyNames > 0 then
 		for _, propName in propertyNames do
-			local ok, value = pcall(function()
+			local readOk, value = pcall(function()
 				return instance[propName]
 			end)
-			if ok and value ~= nil and not table.find(SKIP_PROPERTIES, propName) then
+			if readOk and value ~= nil and not table.find(SKIP_PROPERTIES, propName) then
 				result[propName] = serializeValue(value)
 			end
 		end
 	else
 		-- Common properties to try
-		local commonProps = { "Name", "ClassName", "Position", "Size", "Color", "Transparency", "Material", "Anchored", "CanCollide", "Visible", "Text", "TextColor3", "BackgroundColor3", "Source" }
+		local commonProps = {
+			"Name",
+			"ClassName",
+			"Position",
+			"Size",
+			"Color",
+			"Transparency",
+			"Material",
+			"Anchored",
+			"CanCollide",
+			"Visible",
+			"Text",
+			"TextColor3",
+			"BackgroundColor3",
+			"Source",
+		}
 		for _, propName in commonProps do
-			local ok, value = pcall(function()
+			local readOk, value = pcall(function()
 				return instance[propName]
 			end)
-			if ok and value ~= nil then
+			if readOk and value ~= nil then
 				result[propName] = serializeValue(value)
 			end
 		end
