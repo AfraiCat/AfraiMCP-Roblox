@@ -1,17 +1,19 @@
 //! Thin client for the Roblox Open Cloud Assets + Inventory APIs.
 //!
-//! Uses the OAuth access token managed by `oauth.rs`. Designed to surface
-//! useful error messages back to the MCP caller (Roblox's API error bodies
-//! are not always self-explanatory) and to handle the asynchronous upload
-//! pattern: POST kicks off an operation, then we poll for completion.
+//! Credentials come from the [`AuthManager`] (API key by default, OAuth
+//! optional) and are attached per request, so a long-running poll never uses
+//! an expired token. Designed to surface useful error messages back to the MCP
+//! caller (Roblox's API error bodies are not always self-explanatory) and to
+//! handle the asynchronous upload pattern: POST kicks off an operation, then we
+//! poll for completion.
 
 use crate::asset_types::{self, AssetKind, ValidatedFile};
-use crate::oauth::{ensure_access_token, OAuthConfig};
-use crate::token_store::TokenCache;
+use crate::auth::AuthManager;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -55,33 +57,23 @@ struct OperationResponse {
 
 pub struct OpenCloudClient {
     http: reqwest::Client,
-    cache: std::sync::Arc<TokenCache>,
-    config: OAuthConfig,
+    auth: Arc<AuthManager>,
 }
 
 impl OpenCloudClient {
-    pub fn new(cache: std::sync::Arc<TokenCache>, config: OAuthConfig) -> Self {
+    pub fn new(auth: Arc<AuthManager>) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client builder is infallible with default settings"),
-            cache,
-            config,
+            auth,
         }
     }
 
-    /// Get a valid access token (refreshing if needed).
-    async fn token(&self) -> Result<String> {
-        let tokens = ensure_access_token(&self.cache, &self.config).await?;
-        Ok(tokens.access_token)
-    }
-
+    /// The default creator (OAuth only; an API key has none).
     async fn user_id(&self) -> Result<String> {
-        let tokens = ensure_access_token(&self.cache, &self.config).await?;
-        tokens
-            .user_id
-            .ok_or_else(|| eyre!("No user id captured during login; please run roblox_login again"))
+        self.auth.user_id().await
     }
 
     /// Upload a new asset from a local file. Blocks until the operation
@@ -134,12 +126,11 @@ impl OpenCloudClient {
             .text("request", request_json)
             .part("fileContent", file_part(&file, bytes)?);
 
-        let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets");
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
+            .auth
+            .apply(self.http.post(&url))
+            .await?
             .multipart(form)
             .send()
             .await
@@ -182,12 +173,11 @@ impl OpenCloudClient {
             .text("request", request_json)
             .part("fileContent", file_part(&file, bytes)?);
 
-        let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets/{asset_id}");
         let resp = self
-            .http
-            .patch(&url)
-            .bearer_auth(&token)
+            .auth
+            .apply(self.http.patch(&url))
+            .await?
             .multipart(form)
             .send()
             .await
@@ -212,15 +202,16 @@ impl OpenCloudClient {
         operation_path: &str,
         timeout_secs: u64,
     ) -> Result<serde_json::Value> {
-        let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/{operation_path}");
         let mut waited = 0u64;
         let mut delay_ms: u64 = 500;
         loop {
+            // Credentials are applied per poll so an OAuth token that expires
+            // mid-wait is refreshed.
             let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(&token)
+                .auth
+                .apply(self.http.get(&url))
+                .await?
                 .send()
                 .await
                 .wrap_err("GET /assets/v1/operations/{id}")?;
@@ -254,9 +245,8 @@ impl OpenCloudClient {
 
     /// GET /assets/v1/assets/{id} — return raw JSON as-is.
     pub async fn get_asset_info(&self, asset_id: &str) -> Result<serde_json::Value> {
-        let token = self.token().await?;
         let url = format!("{ASSETS_BASE}/assets/{asset_id}");
-        let resp = self.http.get(&url).bearer_auth(&token).send().await?;
+        let resp = self.auth.apply(self.http.get(&url)).await?.send().await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -283,7 +273,6 @@ impl OpenCloudClient {
                 uid_owned.as_str()
             }
         };
-        let token = self.token().await?;
         let mut url = format!("{CLOUD_V2_BASE}/users/{uid}/inventory-items");
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(p) = page_size {
@@ -304,7 +293,7 @@ impl OpenCloudClient {
             url.push('?');
             url.push_str(&q);
         }
-        let resp = self.http.get(&url).bearer_auth(&token).send().await?;
+        let resp = self.auth.apply(self.http.get(&url)).await?.send().await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {

@@ -1,7 +1,8 @@
+use crate::auth::AuthManager;
 use crate::error::{Report, Result};
-use crate::oauth::{self, OAuthConfig};
+use crate::oauth;
 use crate::open_cloud::{OpenCloudClient, UploadArgs};
-use crate::token_store::TokenCache;
+use crate::secret_store::redact;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
@@ -123,7 +124,8 @@ pub enum ServerMode {
 
 /// Tools that need no Studio plugin and stay available in `ServerMode::Cloud`.
 /// Everything else is removed from the tool router in that mode.
-pub const CLOUD_TOOLS: [&str; 6] = [
+pub const CLOUD_TOOLS: [&str; 7] = [
+    "cloud_auth_status",
     "roblox_login",
     "roblox_logout",
     "upload_asset",
@@ -136,13 +138,10 @@ pub const CLOUD_TOOLS: [&str; 6] = [
 pub struct RBXStudioServer {
     mode: ServerMode,
     state: PackedState,
-    /// Shared token cache for OAuth-backed tools. Always present; if OAuth
-    /// env vars aren't set the tools that need them return a helpful error
-    /// instead of crashing.
-    token_cache: Arc<TokenCache>,
-    /// Present only when ROBLOX_OAUTH_CLIENT_ID and _SECRET were found at
-    /// startup. `None` means "OAuth tools should refuse with a setup hint".
-    oauth_config: Option<OAuthConfig>,
+    /// Credentials for the Open Cloud tools (API key by default, OAuth
+    /// optional), resolved on every call. Without any credentials the tools
+    /// return a setup hint instead of crashing.
+    auth: Arc<AuthManager>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -164,8 +163,9 @@ impl ServerHandler for RBXStudioServer {
                     "Open Cloud asset tools only; there is no Roblox Studio connection in this mode. \
 Only upload when the user asked for it in this conversation, and ask where to upload \
 (personal account or a group) unless they already said.
-- roblox_login: First-time / re-auth. Opens a browser tab.
-- roblox_logout: Clear locally stored tokens.
+- cloud_auth_status: Show which credentials are configured (never prints a secret). Check this first.
+- roblox_login: Optional OAuth sign-in. Opens a browser tab. Not needed with an API key.
+- roblox_logout: Clear locally stored OAuth tokens.
 - upload_asset: Upload a local file (Animation/Audio/Decal/Image/Mesh/Model/Video) to the user's account.
 - update_asset: Replace the contents of an existing asset by ID (.fbx files only).
 - get_asset_info: Read asset metadata by ID.
@@ -349,6 +349,16 @@ struct RobloxLogin {}
 struct RobloxLogout {}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct CloudAuthStatus {}
+
+/// Error result for the Open Cloud tools. Everything an agent can read passes
+/// through the redactor, so a key or token that leaks into an error body from
+/// a server or library can not reach the model.
+fn cloud_error(message: String) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(redact(&message))])
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct UploadAsset {
     #[serde(rename = "filePath")]
     #[schemars(description = "Absolute path to the local file to upload. Max 20MB.")]
@@ -454,12 +464,7 @@ enum ToolArgumentValues {
 }
 #[tool_router]
 impl RBXStudioServer {
-    pub fn new(
-        state: PackedState,
-        token_cache: Arc<TokenCache>,
-        oauth_config: Option<OAuthConfig>,
-        mode: ServerMode,
-    ) -> Self {
+    pub fn new(state: PackedState, auth: Arc<AuthManager>, mode: ServerMode) -> Self {
         let mut tool_router = Self::tool_router();
         if mode == ServerMode::Cloud {
             // Removing the routes (not just hiding them in the list) also makes
@@ -473,24 +478,16 @@ impl RBXStudioServer {
         Self {
             mode,
             state,
-            token_cache,
-            oauth_config,
+            auth,
             tool_router,
         }
     }
 
-    /// Helper: build the Open Cloud client or surface a clear error if OAuth
-    /// env vars are missing. Shared by every OAuth-backed tool below.
-    fn open_cloud(&self) -> std::result::Result<OpenCloudClient, ErrorData> {
-        let cfg = self.oauth_config.clone().ok_or_else(|| {
-            ErrorData::invalid_params(
-                "OAuth is not configured. Set ROBLOX_OAUTH_CLIENT_ID and \
-                 ROBLOX_OAUTH_CLIENT_SECRET environment variables on the MCP server \
-                 process, restart it, then run roblox_login.",
-                None,
-            )
-        })?;
-        Ok(OpenCloudClient::new(self.token_cache.clone(), cfg))
+    /// Helper: build the Open Cloud client. Credentials are resolved per
+    /// request, so a missing key surfaces as the tool's error text (with the
+    /// setup hint) rather than here.
+    fn open_cloud(&self) -> OpenCloudClient {
+        OpenCloudClient::new(self.auth.clone())
     }
 
     #[tool(
@@ -695,26 +692,22 @@ impl RBXStudioServer {
         &self,
         Parameters(_args): Parameters<RobloxLogin>,
     ) -> Result<CallToolResult, ErrorData> {
-        let cfg = match self.oauth_config.clone() {
-            Some(c) => c,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "OAuth is not configured. Set ROBLOX_OAUTH_CLIENT_ID and \
-                     ROBLOX_OAUTH_CLIENT_SECRET environment variables on the MCP server \
-                     process and restart it."
-                        .to_string(),
-                )]));
+        let cfg = match self.auth.oauth_config() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(cloud_error(format!(
+                    "OAuth is not configured ({e}). OAuth is optional; an API key set with \
+                     `rbx-studio-mcp set-key` works without logging in."
+                )));
             }
         };
-        match oauth::login(self.token_cache.clone(), &cfg).await {
+        match oauth::login(self.auth.cache(), &cfg).await {
             Ok(tokens) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Logged in as user {}. Granted scope: {}",
                 tokens.user_id.as_deref().unwrap_or("(unknown)"),
                 tokens.scope.as_deref().unwrap_or("(none)")
             ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Login failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("Login failed: {e}"))),
         }
     }
 
@@ -725,24 +718,22 @@ impl RBXStudioServer {
         &self,
         Parameters(_args): Parameters<RobloxLogout>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.token_cache.clear().await {
+        match self.auth.cache().clear().await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(
                 "Cleared local OAuth tokens.".to_string(),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Logout failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("Logout failed: {e}"))),
         }
     }
 
     #[tool(
-        description = "Upload a local file to Roblox as a new asset under the logged-in user's account. assetType is one of Animation, Audio, Decal, Image, Mesh, Model, Video; the file extension and content must match it (see assetType). Returns the resolved asset metadata including assetId on success."
+        description = "Upload a local file to Roblox as a new asset. Pass userId (personal account) or groupId as the creator; an API key has no default account, so ask the user where to upload unless they already said. assetType is one of Animation, Audio, Decal, Image, Mesh, Model, Video; the file extension and content must match it (see assetType). Returns the resolved asset metadata including assetId on success."
     )]
     async fn upload_asset(
         &self,
         Parameters(args): Parameters<UploadAsset>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = self.open_cloud()?;
+        let client = self.open_cloud();
         let upload = UploadArgs {
             file_path: args.file_path,
             asset_type: args.asset_type,
@@ -756,9 +747,7 @@ impl RBXStudioServer {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Upload failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("Upload failed: {e}"))),
         }
     }
 
@@ -769,15 +758,13 @@ impl RBXStudioServer {
         &self,
         Parameters(args): Parameters<UpdateAsset>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = self.open_cloud()?;
+        let client = self.open_cloud();
         let path = std::path::PathBuf::from(&args.file_path);
         match client.update_asset_content(&args.asset_id, &path, 60).await {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Update failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("Update failed: {e}"))),
         }
     }
 
@@ -786,14 +773,12 @@ impl RBXStudioServer {
         &self,
         Parameters(args): Parameters<GetAssetInfo>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = self.open_cloud()?;
+        let client = self.open_cloud();
         match client.get_asset_info(&args.asset_id).await {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "get_asset_info failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("get_asset_info failed: {e}"))),
         }
     }
 
@@ -804,7 +789,7 @@ impl RBXStudioServer {
         &self,
         Parameters(args): Parameters<ListMyAssets>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = self.open_cloud()?;
+        let client = self.open_cloud();
         match client
             .list_inventory(
                 args.user_id.as_deref(),
@@ -817,10 +802,21 @@ impl RBXStudioServer {
             Ok(v) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "list_my_assets failed: {e}"
-            ))])),
+            Err(e) => Ok(cloud_error(format!("list_my_assets failed: {e}"))),
         }
+    }
+
+    #[tool(
+        description = "Show which Roblox credentials are configured (API key, OAuth), what Roblox reports about the API key (permissions, expiry, warnings) and where secrets are stored. Never prints a secret. Call this before uploading, and tell the user to run `rbx-studio-mcp set-key` in a terminal if nothing is configured."
+    )]
+    async fn cloud_auth_status(
+        &self,
+        Parameters(_args): Parameters<CloudAuthStatus>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let status = self.auth.status().await;
+        Ok(CallToolResult::success(vec![Content::text(redact(
+            &serde_json::to_string_pretty(&status).unwrap_or_else(|_| status.to_string()),
+        ))]))
     }
 
     async fn generic_tool_run(
@@ -1117,12 +1113,62 @@ mod tests {
     ];
 
     fn server(mode: ServerMode) -> RBXStudioServer {
+        use crate::secret_store::{MemoryStore, SecretStore};
+        use crate::token_store::TokenCache;
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        let cache = Arc::new(TokenCache::new(store.clone()));
         RBXStudioServer::new(
             Arc::new(Mutex::new(AppState::new())),
-            Arc::new(TokenCache::new()),
-            None,
+            Arc::new(AuthManager::new(store, cache)),
             mode,
         )
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        serde_json::to_string(result).unwrap()
+    }
+
+    #[test]
+    fn cloud_error_redacts_secret_shaped_values() {
+        let leaked = "Zk3fQ9xLmN2pRt7vWb4YcD8eHjK5sUaP1gXoIq6TyChEzF0lBnMrVd9wSuOe3A";
+        let result = cloud_error(format!(
+            "Upload failed: bad key {leaked}; x-api-key: abcdef123456"
+        ));
+        let text = result_text(&result);
+        assert!(!text.contains(leaked), "{text}");
+        assert!(!text.contains("abcdef123456"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn tools_explain_how_to_set_up_credentials_when_none_exist() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .get_asset_info(Parameters(GetAssetInfo {
+                asset_id: "1".to_string(),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("set-key"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_status_tool_reports_none_without_leaking() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .cloud_auth_status(Parameters(CloudAuthStatus {}))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("activeMethod"), "{text}");
+        assert!(text.contains("none"), "{text}");
+    }
+
+    #[test]
+    fn cloud_tools_are_the_documented_seven_and_studio_adds_seventeen() {
+        assert_eq!(CLOUD_TOOLS.len(), 7);
+        assert_eq!(tool_names(&server(ServerMode::Studio)).len(), 24);
+        assert_eq!(tool_names(&server(ServerMode::Cloud)).len(), 7);
     }
 
     fn tool_names(server: &RBXStudioServer) -> BTreeSet<String> {

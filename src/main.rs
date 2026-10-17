@@ -11,6 +11,7 @@ use tracing_subscriber::{self, EnvFilter};
 mod asset_types;
 mod audit;
 mod auth;
+mod cli;
 mod error;
 mod install;
 mod oauth;
@@ -20,7 +21,6 @@ mod rbx_studio_server;
 mod secret_store;
 mod token_store;
 
-use oauth::OAuthConfig;
 use token_store::TokenCache;
 
 /// Simple MCP proxy for Roblox Studio
@@ -36,6 +36,43 @@ struct Args {
     /// or `cloud` (Open Cloud tools only; no Studio plugin port is bound)
     #[arg(long, value_enum, default_value_t = ServerMode::Studio)]
     mode: ServerMode,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// One-time terminal commands for credentials. They never run as MCP tools, so
+/// an agent cannot read or change a secret.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Store an API key (default) or OAuth client secret through a hidden prompt
+    SetKey {
+        #[arg(long, value_enum, default_value_t = cli::KeyKind::ApiKey)]
+        kind: cli::KeyKind,
+    },
+    /// Remove a stored API key (default) or OAuth client secret
+    DeleteKey {
+        #[arg(long, value_enum, default_value_t = cli::KeyKind::ApiKey)]
+        kind: cli::KeyKind,
+    },
+    /// Show what is configured and what Roblox reports about the API key (no secrets printed)
+    AuthStatus,
+    /// Import the old plaintext OAuth token file into secure storage, then ask before deleting it
+    MigrateTokens,
+}
+
+async fn run_command(command: Command) -> Result<()> {
+    let store = secret_store::default_store();
+    match command {
+        Command::SetKey { kind } => cli::set_key(store.as_ref(), kind),
+        Command::DeleteKey { kind } => cli::delete_key(store.as_ref(), kind),
+        Command::AuthStatus => cli::auth_status(store).await,
+        Command::MigrateTokens => cli::migrate_tokens(
+            store.as_ref(),
+            &mut io::stdin().lock(),
+            &mut io::stdout().lock(),
+        ),
+    }
 }
 
 impl Args {
@@ -89,13 +126,18 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(io::stderr)
+        // Every log line passes through the redactor so a key or token can
+        // never reach stderr, even from a third-party crate's debug output.
+        .with_writer(|| secret_store::RedactingWriter(io::stderr()))
         .with_target(false)
         .with_thread_ids(true)
         .init();
 
     let args = Args::parse();
     args.check()?;
+    if let Some(command) = args.command {
+        return run_command(command).await;
+    }
     if !args.stdio {
         return install::install().await;
     }
@@ -114,33 +156,20 @@ async fn main() -> Result<()> {
         }
     };
 
-    // OAuth config is optional — env vars are only needed for the upload /
-    // asset-management tools. Missing env vars simply means those tools
-    // return a "set these env vars and restart" error.
-    let oauth_config = OAuthConfig::from_env();
-    if oauth_config.is_some() {
-        tracing::info!(
-            "OAuth env vars detected. Open Cloud tools (upload_asset, etc.) are available."
-        );
-    } else {
-        tracing::info!(
-            "ROBLOX_OAUTH_CLIENT_ID / ROBLOX_OAUTH_CLIENT_SECRET not set; Open Cloud tools disabled."
-        );
-    }
-    let token_cache = Arc::new(TokenCache::new());
+    // Credentials live in the secret store (Windows DPAPI) and are resolved on
+    // every call, so `set-key` takes effect without a restart. Without any
+    // credentials the Open Cloud tools return a setup hint instead.
+    let store = secret_store::default_store();
+    tracing::info!("Secret storage backend: {}", store.backend());
+    let token_cache = Arc::new(TokenCache::new(Arc::clone(&store)));
+    let auth = Arc::new(auth::AuthManager::new(store, token_cache));
 
-    // Create an instance of our counter router
-    let service = RBXStudioServer::new(
-        Arc::clone(&server_state),
-        token_cache,
-        oauth_config,
-        args.mode,
-    )
-    .serve(rmcp::transport::stdio())
-    .await
-    .inspect_err(|e| {
-        tracing::error!("serving error: {:?}", e);
-    })?;
+    let service = RBXStudioServer::new(Arc::clone(&server_state), auth, args.mode)
+        .serve(rmcp::transport::stdio())
+        .await
+        .inspect_err(|e| {
+            tracing::error!("serving error: {:?}", e);
+        })?;
     service.waiting().await?;
 
     close_tx.send(()).ok();
@@ -186,6 +215,39 @@ mod tests {
     fn mode_rejects_unknown_values() {
         assert!(parse(&["--stdio", "--mode", "both"]).is_err());
         assert!(parse(&["--stdio", "--mode"]).is_err());
+    }
+
+    #[test]
+    fn credential_subcommands_parse_and_default_to_the_api_key() {
+        let set = parse(&["set-key"]).unwrap();
+        assert!(matches!(
+            set.command,
+            Some(Command::SetKey {
+                kind: cli::KeyKind::ApiKey
+            })
+        ));
+        let oauth = parse(&["set-key", "--kind", "oauth-client-secret"]).unwrap();
+        assert!(matches!(
+            oauth.command,
+            Some(Command::SetKey {
+                kind: cli::KeyKind::OauthClientSecret
+            })
+        ));
+        assert!(matches!(
+            parse(&["auth-status"]).unwrap().command,
+            Some(Command::AuthStatus)
+        ));
+        assert!(matches!(
+            parse(&["migrate-tokens"]).unwrap().command,
+            Some(Command::MigrateTokens)
+        ));
+        assert!(parse(&["--stdio"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn a_secret_can_not_be_passed_as_an_argument() {
+        assert!(parse(&["set-key", "--value", "abc"]).is_err());
+        assert!(parse(&["set-key", "abc"]).is_err());
     }
 
     #[test]

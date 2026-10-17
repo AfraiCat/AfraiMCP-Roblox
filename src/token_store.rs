@@ -1,22 +1,25 @@
 //! Persistent storage for Roblox OAuth tokens.
 //!
-//! Tokens live in a JSON file under the OS-appropriate config directory
-//! (Linux: ~/.config/rbx-studio-mcp/, macOS: ~/Library/Application Support/...,
-//! Windows: %APPDATA%/rbx-studio-mcp/). On Unix the file is chmod 0600 so
-//! other users on the machine can't read it. We never persist the client
-//! secret here — that comes from the environment at runtime.
+//! Tokens are serialized to JSON and kept in the [`SecretStore`] (Windows
+//! DPAPI: encrypted at rest) under the name `OAUTH_TOKENS`. The previous
+//! version wrote `oauth-tokens.json` in plaintext under the config directory;
+//! that file is never read implicitly any more. [`import_legacy`] copies it
+//! into the secure store on request and [`delete_legacy_file`] removes it only
+//! when the caller (the CLI, after asking the user) says so.
 
+use crate::secret_store::{Secret, SecretStore, OAUTH_TOKENS};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 const APP_DIR: &str = "rbx-studio-mcp";
-const TOKEN_FILE: &str = "oauth-tokens.json";
+const LEGACY_TOKEN_FILE: &str = "oauth-tokens.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: String,
@@ -28,115 +31,179 @@ pub struct StoredTokens {
     pub scope: Option<String>,
 }
 
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("access_token_expires_at", &self.access_token_expires_at)
+            .field("user_id", &self.user_id)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 impl StoredTokens {
     /// True if the access token has less than `skew` seconds left.
     pub fn is_expired(&self, skew_secs: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         // Refresh proactively rather than letting the API return a 401.
-        self.access_token_expires_at <= now.saturating_add(skew_secs)
+        self.access_token_expires_at <= now_secs().saturating_add(skew_secs)
+    }
+
+    /// Seconds until the access token expires (0 if already expired).
+    pub fn seconds_left(&self) -> u64 {
+        self.access_token_expires_at.saturating_sub(now_secs())
     }
 }
 
-fn config_dir() -> Result<PathBuf> {
-    let base =
-        dirs::config_dir().ok_or_else(|| eyre!("Could not determine OS config directory"))?;
-    Ok(base.join(APP_DIR))
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-fn token_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join(TOKEN_FILE))
+/// Location of the old plaintext token file (may not exist).
+pub fn legacy_token_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(APP_DIR).join(LEGACY_TOKEN_FILE))
 }
 
-/// Read tokens from disk. Returns `Ok(None)` if no token file exists yet —
-/// callers should interpret that as "user hasn't logged in".
-pub fn load() -> Result<Option<StoredTokens>> {
-    let path = token_path()?;
-    if !path.exists() {
+/// The old plaintext token file, if it is still on disk.
+pub fn legacy_token_file() -> Option<PathBuf> {
+    legacy_token_path().filter(|p| p.exists())
+}
+
+/// Copy the legacy plaintext token file into the secure store. Does not
+/// delete anything. Returns the file that was imported.
+pub fn import_legacy(store: &dyn SecretStore) -> Result<Option<PathBuf>> {
+    let Some(path) = legacy_token_file() else {
         return Ok(None);
-    }
-    let bytes =
-        fs::read(&path).wrap_err_with(|| format!("Reading token file at {}", path.display()))?;
-    let tokens: StoredTokens = serde_json::from_slice(&bytes)
-        .wrap_err_with(|| format!("Parsing token file at {}", path.display()))?;
-    Ok(Some(tokens))
+    };
+    let bytes = fs::read(&path).wrap_err("reading the legacy token file")?;
+    let tokens: StoredTokens =
+        serde_json::from_slice(&bytes).wrap_err("parsing the legacy token file")?;
+    store.set(OAUTH_TOKENS, &serialize(&tokens)?)?;
+    Ok(Some(path))
 }
 
-/// Write tokens atomically (write-to-temp-then-rename) so a crash mid-write
-/// can't leave a half-written file that fails to parse.
-pub fn save(tokens: &StoredTokens) -> Result<()> {
-    let dir = config_dir()?;
-    fs::create_dir_all(&dir).wrap_err_with(|| format!("Creating config dir {}", dir.display()))?;
-    let final_path = dir.join(TOKEN_FILE);
-    let tmp_path = dir.join(format!("{TOKEN_FILE}.tmp"));
-
-    let json = serde_json::to_vec_pretty(tokens)?;
-    fs::write(&tmp_path, &json)
-        .wrap_err_with(|| format!("Writing token file at {}", tmp_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(&tmp_path, perms) {
-            tracing::warn!("Could not set 0600 perms on token file: {e}");
-        }
-    }
-
-    fs::rename(&tmp_path, &final_path)
-        .wrap_err_with(|| format!("Renaming token file to {}", final_path.display()))?;
-    Ok(())
+/// Delete the legacy plaintext token file. Callers must have asked the user.
+pub fn delete_legacy_file(path: &std::path::Path) -> Result<()> {
+    fs::remove_file(path).wrap_err("removing the legacy token file")
 }
 
-/// Remove the token file. Used by `roblox_logout`. Missing file is not an error.
-pub fn clear() -> Result<()> {
-    let path = token_path()?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).wrap_err_with(|| format!("Removing {}", path.display())),
-    }
+fn serialize(tokens: &StoredTokens) -> Result<Secret> {
+    Ok(Secret::new(serde_json::to_string(tokens)?))
 }
 
-/// In-memory cache so we don't hit the filesystem on every API call.
+fn parse(secret: &Secret) -> Result<StoredTokens> {
+    serde_json::from_str(secret.expose())
+        .map_err(|_| eyre!("the stored OAuth tokens are damaged; run roblox_login again"))
+}
+
+/// In-memory cache over the secure store so we don't decrypt on every API call.
 /// Wrapped in a Mutex because the MCP server is multi-threaded and a token
-/// refresh can race with a concurrent read. The lock is held only across
-/// disk reads/writes; the actual HTTP refresh runs without the lock held.
+/// refresh can race with a concurrent read. The lock is held only across store
+/// reads/writes; the actual HTTP refresh runs without the lock held.
 pub struct TokenCache {
+    store: Arc<dyn SecretStore>,
     inner: Mutex<Option<StoredTokens>>,
 }
 
 impl TokenCache {
-    pub fn new() -> Self {
+    pub fn new(store: Arc<dyn SecretStore>) -> Self {
         Self {
+            store,
             inner: Mutex::new(None),
         }
     }
 
-    /// Get the currently cached tokens, loading from disk on first access.
+    /// Get the currently cached tokens, loading from the store on first access.
     pub async fn get(&self) -> Result<Option<StoredTokens>> {
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
-            *guard = load()?;
+            if let Some(secret) = self.store.get(OAUTH_TOKENS)? {
+                *guard = Some(parse(&secret)?);
+            }
         }
         Ok(guard.clone())
     }
 
-    /// Replace the cached tokens and persist to disk.
+    /// Replace the cached tokens and persist them to the secure store.
     pub async fn set(&self, tokens: StoredTokens) -> Result<()> {
-        save(&tokens)?;
+        self.store.set(OAUTH_TOKENS, &serialize(&tokens)?)?;
         let mut guard = self.inner.lock().await;
         *guard = Some(tokens);
         Ok(())
     }
 
-    /// Drop tokens from memory and disk.
+    /// Drop tokens from memory and from the store.
     pub async fn clear(&self) -> Result<()> {
-        clear()?;
+        self.store.delete(OAUTH_TOKENS)?;
         let mut guard = self.inner.lock().await;
         *guard = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secret_store::MemoryStore;
+
+    fn sample() -> StoredTokens {
+        StoredTokens {
+            access_token: "access-token-sample-0001".into(),
+            refresh_token: "refresh-token-sample-0002".into(),
+            access_token_expires_at: now_secs() + 900,
+            user_id: Some("123".into()),
+            scope: Some("asset:read asset:write".into()),
+        }
+    }
+
+    #[test]
+    fn debug_output_hides_both_tokens() {
+        let text = format!("{:?}", sample());
+        assert!(!text.contains("access-token-sample"), "{text}");
+        assert!(!text.contains("refresh-token-sample"), "{text}");
+        assert!(text.contains("123"));
+    }
+
+    #[tokio::test]
+    async fn cache_round_trips_through_the_store_and_clears() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        let cache = TokenCache::new(store.clone());
+        assert!(cache.get().await.unwrap().is_none());
+        cache.set(sample()).await.unwrap();
+
+        // A fresh cache over the same store sees the persisted tokens.
+        let again = TokenCache::new(store.clone());
+        let loaded = again.get().await.unwrap().unwrap();
+        assert_eq!(loaded.refresh_token, "refresh-token-sample-0002");
+        assert!(!loaded.is_expired(60));
+
+        cache.clear().await.unwrap();
+        assert!(store.get(OAUTH_TOKENS).unwrap().is_none());
+        assert!(cache.get().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn damaged_store_content_gives_a_clean_error() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        store
+            .set(OAUTH_TOKENS, &Secret::new("not json at all"))
+            .unwrap();
+        let err = TokenCache::new(store).get().await.unwrap_err().to_string();
+        assert!(err.contains("roblox_login"), "{err}");
+        assert!(!err.contains("not json"), "{err}");
+    }
+
+    #[test]
+    fn expiry_math() {
+        let mut t = sample();
+        t.access_token_expires_at = now_secs() + 30;
+        assert!(t.is_expired(60));
+        assert!(t.seconds_left() <= 30);
+        t.access_token_expires_at = 0;
+        assert_eq!(t.seconds_left(), 0);
     }
 }
