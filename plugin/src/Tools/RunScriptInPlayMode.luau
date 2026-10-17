@@ -42,8 +42,21 @@ end)
 
 local startTime = os.clock()
 local isTimeout = false
+-- Declared BEFORE endTest so endTest sees them as locals instead of
+-- falling through to nil globals. Previous version always reported
+-- success/value/error as nil.
+local ok: boolean? = nil
+local result: any = nil
+local didEnd = false
 
 local function endTest()
+	-- Guard against EndTest being called twice (once by timeout, once by
+	-- the pcall finishing). Calling EndTest twice has undefined behavior.
+	if didEnd then
+		return
+	end
+	didEnd = true
+
 	local duration = os.clock() - startTime
 	task.wait(0.1)
 
@@ -57,9 +70,9 @@ local function endTest()
 	end
 
 	StudioTestService:EndTest({
-		success = ok,
+		success = ok == true,
 		value = if ok then tostring(result) else nil,
-		error = if not ok then tostring(result) else nil,
+		error = if ok == false then tostring(result) else nil,
 		logs = capturedLogs,
 		errors = errors,
 		duration = duration,
@@ -69,12 +82,13 @@ end
 
 
 task.spawn(function()
-	wait(]] .. timeoutStr .. [[)
+	task.wait(]] .. timeoutStr .. [[)
+	if didEnd then return end
 	isTimeout = true
 	endTest()
 end)
 
-local ok, result = pcall(function()
+ok, result = pcall(function()
 ]] .. userCode .. [[
 
 end)
@@ -104,6 +118,7 @@ local function runScriptInPlayMode(args: Types.RunScriptInPlayModeArgs): string?
 	injectTestScript(args)
 
 	ConsoleOutput.outputMessage = ""
+	ConsoleOutput.truncated = false
 	local success, result = pcall(function()
 		if args.mode == "start_play" then
 			GlobalVariables.studioMode = "start_play"
@@ -137,7 +152,7 @@ local function handleRunScriptInPlayMode(runScriptInPlayModeArgs: Types.RunScrip
 	end
 
 	StartStopPlay({ mode = "stop" })
-	wait(0.2)
+	task.wait(0.2)
 
 	return runScriptInPlayMode(runScriptInPlayModeArgs)
 end

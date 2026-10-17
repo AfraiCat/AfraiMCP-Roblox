@@ -40,6 +40,7 @@ end
 
 local function startPlay(): string?
 	ConsoleOutput.outputMessage = ""
+	ConsoleOutput.truncated = false
 	GlobalVariables.studioMode = "start_play"
 	local result, isTimeout = callWithTimeout(function()
 		return StudioTestService:ExecutePlayModeAsync({})
@@ -52,7 +53,7 @@ end
 
 local function stop(): string?
 	GameStopUtil.stopPlay()
-	wait(1)
+	task.wait(1)
 	GlobalVariables.studioMode = "stop"
 	return "Stopped"
 end

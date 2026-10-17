@@ -1,10 +1,11 @@
 use crate::error::{Report, Result};
+use crate::oauth::{self, OAuthConfig};
+use crate::open_cloud::{OpenCloudClient, UploadArgs};
+use crate::token_store::TokenCache;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
 use color_eyre::eyre::{eyre, Error, OptionExt};
-use std::path::PathBuf;
-use tokio::process::Command;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -14,7 +15,9 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
@@ -22,6 +25,13 @@ use uuid::Uuid;
 
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
 const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
+// Default per-tool timeout on the MCP->plugin round trip. Covers the common
+// hang case (plugin disconnected, Studio frozen, tool yielding forever inside
+// Roblox). run_script_in_play_mode passes its own longer timeout below.
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
+// Extra slack on top of the user-provided timeout for run_script_in_play_mode
+// so the plugin has room to tear down the play session and send its reply.
+const PLAY_MODE_TIMEOUT_SLACK: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolArguments {
@@ -71,15 +81,99 @@ impl ToolArguments {
         )
     }
 }
+
+/// RAII guard that removes an entry from `AppState::output_map` when dropped.
+/// Ensures cleanup on timeout, cancellation, or normal completion.
+struct OutputMapGuard {
+    state: PackedState,
+    id: Uuid,
+}
+
+impl OutputMapGuard {
+    fn new(state: PackedState, id: Uuid) -> Self {
+        Self { state, id }
+    }
+}
+
+impl Drop for OutputMapGuard {
+    fn drop(&mut self) {
+        // Spawn a task because Drop isn't async. `try_lock` first to avoid
+        // spawning when we can clean up inline.
+        if let Ok(mut state) = self.state.try_lock() {
+            state.output_map.remove(&self.id);
+            return;
+        }
+        let state = self.state.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            let mut state = state.lock().await;
+            state.output_map.remove(&id);
+        });
+    }
+}
+/// Which tool set this process serves (`--mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServerMode {
+    /// Studio plugin tools plus the Open Cloud tools (the original behaviour).
+    #[default]
+    Studio,
+    /// Only the Open Cloud tools: no Studio plugin port and no plugin server.
+    Cloud,
+}
+
+/// Tools that need no Studio plugin and stay available in `ServerMode::Cloud`.
+/// Everything else is removed from the tool router in that mode.
+pub const CLOUD_TOOLS: [&str; 6] = [
+    "roblox_login",
+    "roblox_logout",
+    "upload_asset",
+    "update_asset",
+    "get_asset_info",
+    "list_my_assets",
+];
+
 #[derive(Clone)]
 pub struct RBXStudioServer {
+    mode: ServerMode,
     state: PackedState,
+    /// Shared token cache for OAuth-backed tools. Always present; if OAuth
+    /// env vars aren't set the tools that need them return a helpful error
+    /// instead of crashing.
+    token_cache: Arc<TokenCache>,
+    /// Present only when ROBLOX_OAUTH_CLIENT_ID and _SECRET were found at
+    /// startup. `None` means "OAuth tools should refuse with a setup hint".
+    oauth_config: Option<OAuthConfig>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_handler]
 impl ServerHandler for RBXStudioServer {
     fn get_info(&self) -> ServerInfo {
+        if self.mode == ServerMode::Cloud {
+            return ServerInfo {
+                protocol_version: ProtocolVersion::LATEST,
+                capabilities: ServerCapabilities::builder().enable_tools().build(),
+                server_info: Implementation {
+                    name: "Roblox_Cloud".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    title: Some("Roblox Cloud MCP Server (Custom Fork)".to_string()),
+                    icons: None,
+                    website_url: None,
+                },
+                instructions: Some(
+                    "Open Cloud asset tools only; there is no Roblox Studio connection in this mode. \
+Only upload when the user asked for it in this conversation, and ask where to upload \
+(personal account or a group) unless they already said.
+- roblox_login: First-time / re-auth. Opens a browser tab.
+- roblox_logout: Clear locally stored tokens.
+- upload_asset: Upload a local file to the user's account.
+- update_asset: Replace contents of an existing asset by ID.
+- get_asset_info: Read asset metadata by ID.
+- list_my_assets: Page through the logged-in user's inventory."
+                        .to_string(),
+                ),
+            };
+        }
         ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -101,7 +195,16 @@ Use run_code for custom logic or when no dedicated tool exists.
 After run_script_in_play_mode, datamodel resets to stop. Prefer start_stop_play; use run_script_in_play_mode only for one-off server tests.
 Batch operations: use batch_apply to set properties on multiple instances (by tag, className, or path).
 Selection: use select_instances and open_script for Explorer/editor navigation.
-Rojo tools (rojo_sourcemap, rojo_build) run on host; require Rojo installed."
+Rojo tools (rojo_sourcemap, rojo_build) run on host; require Rojo installed.
+
+OAuth-backed Open Cloud tools (require ROBLOX_OAUTH_CLIENT_ID / ROBLOX_OAUTH_CLIENT_SECRET env vars and a one-time roblox_login):
+- roblox_login: First-time / re-auth. Opens a browser tab.
+- roblox_logout: Revoke locally stored tokens.
+- upload_asset: Upload a local file (Decal/Audio/Model/etc.) to the user's account.
+- update_asset: Replace contents of an existing asset by ID.
+- get_asset_info: Read asset metadata by ID.
+- list_my_assets: Page through the logged-in user's inventory.
+These tools live in the Rust process and do not require Roblox Studio to be running."
                     .to_string(),
             ),
         }
@@ -150,10 +253,14 @@ struct RunScriptInPlayMode {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct GetInstanceTree {
     #[serde(rename = "rootPath")]
-    #[schemars(description = "Root path (e.g. 'game', 'Workspace', 'Workspace.Model'). Default: game")]
+    #[schemars(
+        description = "Root path (e.g. 'game', 'Workspace', 'Workspace.Model'). Default: game"
+    )]
     root_path: Option<String>,
     #[serde(rename = "maxDepth")]
-    #[schemars(description = "Max depth for tree traversal. Default: 3, max: 5. Use narrower rootPath (e.g. Workspace.MyModel) for deeper trees.")]
+    #[schemars(
+        description = "Max depth for tree traversal. Default: 3, max: 5. Use narrower rootPath (e.g. Workspace.MyModel) for deeper trees."
+    )]
     max_depth: Option<u32>,
 }
 
@@ -163,7 +270,9 @@ struct GetProperties {
     #[schemars(description = "Instance path (e.g. 'Workspace.Part', 'game.Lighting')")]
     instance_path: String,
     #[serde(rename = "propertyNames")]
-    #[schemars(description = "Optional list of property names to fetch. If omitted, returns common properties")]
+    #[schemars(
+        description = "Optional list of property names to fetch. If omitted, returns common properties"
+    )]
     property_names: Option<Vec<String>>,
 }
 
@@ -177,7 +286,9 @@ struct BatchApply {
     selector_value: String,
     #[schemars(description = "Property to set (e.g. Color, Position, Size)")]
     property: String,
-    #[schemars(description = "Value to set. For Color use [r,g,b] 0-1. For Position/Size use [x,y,z]")]
+    #[schemars(
+        description = "Value to set. For Color use [r,g,b] 0-1. For Position/Size use [x,y,z]"
+    )]
     value: serde_json::Value,
 }
 
@@ -228,11 +339,86 @@ struct GetAssetIds {
     asset_types: Option<Vec<String>>,
 }
 
+// OAuth + Open Cloud arg structs. These tools run entirely in the Rust
+// process and do not need the Studio plugin.
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct RobloxLogin {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct RobloxLogout {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct UploadAsset {
+    #[serde(rename = "filePath")]
+    #[schemars(description = "Absolute path to the local file to upload. Max 20MB.")]
+    file_path: String,
+    #[serde(rename = "assetType")]
+    #[schemars(
+        description = "One of: Decal, Audio, Model, ModelFromFbx, MeshPart, Animation, Video"
+    )]
+    asset_type: String,
+    #[serde(rename = "displayName")]
+    #[schemars(description = "Display name shown on the Roblox catalog page")]
+    display_name: String,
+    #[schemars(description = "Optional description")]
+    description: Option<String>,
+    /// Override the creator. Defaults to the logged-in user.
+    #[serde(rename = "userId")]
+    #[schemars(
+        description = "Optional override: upload under this user ID (defaults to current user)"
+    )]
+    user_id: Option<String>,
+    #[serde(rename = "groupId")]
+    #[schemars(
+        description = "Optional override: upload under this group ID. Mutually exclusive with userId."
+    )]
+    group_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct UpdateAsset {
+    #[serde(rename = "assetId")]
+    #[schemars(description = "ID of the existing asset to update")]
+    asset_id: String,
+    #[serde(rename = "filePath")]
+    #[schemars(description = "Absolute path to the new local file. Max 20MB.")]
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct GetAssetInfo {
+    #[serde(rename = "assetId")]
+    #[schemars(description = "Asset ID to fetch metadata for")]
+    asset_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct ListMyAssets {
+    #[serde(rename = "userId")]
+    #[schemars(
+        description = "Optional: fetch a different user's inventory. Defaults to the logged-in user."
+    )]
+    user_id: Option<String>,
+    #[serde(rename = "pageSize")]
+    #[schemars(description = "Items per page (1-100). Defaults to Roblox's default.")]
+    page_size: Option<u32>,
+    #[serde(rename = "pageToken")]
+    #[schemars(description = "Pagination cursor returned by a previous call")]
+    page_token: Option<String>,
+    #[schemars(
+        description = "Inventory filter, e.g. 'assetIds=1,2,3' or 'inventoryItemAssetTypes=DECAL'"
+    )]
+    filter: Option<String>,
+}
+
 // Custom fork: Rojo/File sync (runs locally in Rust, not in plugin)
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RojoSourcemap {
     #[serde(rename = "projectPath")]
-    #[schemars(description = "Path to Rojo project (default.project.json) or directory. Default: current workspace")]
+    #[schemars(
+        description = "Path to Rojo project (default.project.json) or directory. Default: current workspace"
+    )]
     project_path: Option<String>,
 }
 
@@ -268,11 +454,43 @@ enum ToolArgumentValues {
 }
 #[tool_router]
 impl RBXStudioServer {
-    pub fn new(state: PackedState) -> Self {
-        Self {
-            state,
-            tool_router: Self::tool_router(),
+    pub fn new(
+        state: PackedState,
+        token_cache: Arc<TokenCache>,
+        oauth_config: Option<OAuthConfig>,
+        mode: ServerMode,
+    ) -> Self {
+        let mut tool_router = Self::tool_router();
+        if mode == ServerMode::Cloud {
+            // Removing the routes (not just hiding them in the list) also makes
+            // call_tool refuse the Studio tools in cloud mode.
+            for tool in tool_router.list_all() {
+                if !CLOUD_TOOLS.contains(&tool.name.as_ref()) {
+                    tool_router.remove_route(&tool.name);
+                }
+            }
         }
+        Self {
+            mode,
+            state,
+            token_cache,
+            oauth_config,
+            tool_router,
+        }
+    }
+
+    /// Helper: build the Open Cloud client or surface a clear error if OAuth
+    /// env vars are missing. Shared by every OAuth-backed tool below.
+    fn open_cloud(&self) -> std::result::Result<OpenCloudClient, ErrorData> {
+        let cfg = self.oauth_config.clone().ok_or_else(|| {
+            ErrorData::invalid_params(
+                "OAuth is not configured. Set ROBLOX_OAUTH_CLIENT_ID and \
+                 ROBLOX_OAUTH_CLIENT_SECRET environment variables on the MCP server \
+                 process, restart it, then run roblox_login.",
+                None,
+            )
+        })?;
+        Ok(OpenCloudClient::new(self.token_cache.clone(), cfg))
     }
 
     #[tool(
@@ -468,10 +686,157 @@ impl RBXStudioServer {
         self.run_rojo_build(args).await
     }
 
+    // -------- OAuth + Open Cloud tools (run in Rust, no plugin needed) --------
+
+    #[tool(
+        description = "Start the Roblox OAuth login flow. Opens your browser to authorize this MCP, then stores access/refresh tokens locally so subsequent upload/asset tools work without re-prompting. Re-run to switch accounts or after revoking."
+    )]
+    async fn roblox_login(
+        &self,
+        Parameters(_args): Parameters<RobloxLogin>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cfg = match self.oauth_config.clone() {
+            Some(c) => c,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "OAuth is not configured. Set ROBLOX_OAUTH_CLIENT_ID and \
+                     ROBLOX_OAUTH_CLIENT_SECRET environment variables on the MCP server \
+                     process and restart it."
+                        .to_string(),
+                )]));
+            }
+        };
+        match oauth::login(self.token_cache.clone(), &cfg).await {
+            Ok(tokens) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Logged in as user {}. Granted scope: {}",
+                tokens.user_id.as_deref().unwrap_or("(unknown)"),
+                tokens.scope.as_deref().unwrap_or("(none)")
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Login failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Clear locally stored OAuth tokens. After this, the next upload/asset tool call requires roblox_login. Does not revoke tokens on Roblox's side; do that from the Creator Dashboard if you need to."
+    )]
+    async fn roblox_logout(
+        &self,
+        Parameters(_args): Parameters<RobloxLogout>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.token_cache.clear().await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+                "Cleared local OAuth tokens.".to_string(),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Logout failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Upload a local file to Roblox as a new asset under the logged-in user's account. Returns the resolved asset metadata including assetId on success."
+    )]
+    async fn upload_asset(
+        &self,
+        Parameters(args): Parameters<UploadAsset>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = self.open_cloud()?;
+        let upload = UploadArgs {
+            file_path: args.file_path,
+            asset_type: args.asset_type,
+            display_name: args.display_name,
+            description: args.description,
+            user_id: args.user_id,
+            group_id: args.group_id,
+            poll_timeout_secs: None,
+        };
+        match client.upload_asset(upload).await {
+            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Upload failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Replace the contents of an existing asset (by assetId) with the bytes of a local file. The asset type stays the same. Returns the updated asset metadata."
+    )]
+    async fn update_asset(
+        &self,
+        Parameters(args): Parameters<UpdateAsset>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = self.open_cloud()?;
+        let path = std::path::PathBuf::from(&args.file_path);
+        match client.update_asset_content(&args.asset_id, &path, 60).await {
+            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Update failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Get metadata for a Roblox asset by ID via the Open Cloud Assets API.")]
+    async fn get_asset_info(
+        &self,
+        Parameters(args): Parameters<GetAssetInfo>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = self.open_cloud()?;
+        match client.get_asset_info(&args.asset_id).await {
+            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "get_asset_info failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "List inventory items belonging to a user (defaults to the logged-in user). Supports pagination and Roblox's filter syntax."
+    )]
+    async fn list_my_assets(
+        &self,
+        Parameters(args): Parameters<ListMyAssets>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = self.open_cloud()?;
+        match client
+            .list_inventory(
+                args.user_id.as_deref(),
+                args.page_size,
+                args.page_token.as_deref(),
+                args.filter.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "list_my_assets failed: {e}"
+            ))])),
+        }
+    }
+
     async fn generic_tool_run(
         &self,
         args: ToolArgumentValues,
     ) -> Result<CallToolResult, ErrorData> {
+        // Choose a per-call timeout. run_script_in_play_mode gets the user's
+        // requested timeout plus slack; everything else gets the default.
+        let tool_timeout = match &args {
+            ToolArgumentValues::RunScriptInPlayMode(inner) => {
+                let base = inner.timeout.unwrap_or(100) as u64;
+                Duration::from_secs(base).saturating_add(PLAY_MODE_TIMEOUT_SLACK)
+            }
+            _ => DEFAULT_TOOL_TIMEOUT,
+        };
+
         let (command, id) = ToolArguments::new(args);
         tracing::debug!("Running command: {:?}", command);
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
@@ -484,25 +849,49 @@ impl RBXStudioServer {
         trigger
             .send(())
             .map_err(|e| ErrorData::internal_error(format!("Unable to trigger send {e}"), None))?;
-        let result = rx
-            .recv()
-            .await
-            .ok_or(ErrorData::internal_error("Couldn't receive response", None))?;
-        {
-            let mut state = self.state.lock().await;
-            state.output_map.remove_entry(&id);
-        }
-        tracing::debug!("Sending to MCP: {result:?}");
-        match result {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-            Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
+
+        // Guard cleans up output_map on every exit path (timeout, future drop,
+        // or normal completion). Without this, a cancelled call or timed-out
+        // response leaks a sender and a stale UUID that can later trigger
+        // "Unknown ID" errors on the response endpoint.
+        let guard = OutputMapGuard::new(self.state.clone(), id);
+        let recv_result = tokio::time::timeout(tool_timeout, rx.recv()).await;
+        drop(guard);
+
+        match recv_result {
+            Err(_) => {
+                // Also evict the command from the queue if the plugin never
+                // picked it up (disconnected before /request). This avoids
+                // stale commands running on next reconnect.
+                {
+                    let mut state = self.state.lock().await;
+                    state.process_queue.retain(|cmd| cmd.id != Some(id));
+                }
+                tracing::warn!(
+                    "Tool call {id} timed out after {:?}; plugin may be disconnected or stuck",
+                    tool_timeout
+                );
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Tool call timed out after {}s. The Roblox Studio plugin did not respond. \
+                     Check that the MCP plugin is enabled in Studio and that Studio is not frozen. \
+                     If a tool is expected to run longer (e.g. run_script_in_play_mode), pass an explicit timeout.",
+                    tool_timeout.as_secs()
+                ))]))
+            }
+            Ok(None) => Ok(CallToolResult::error(vec![Content::text(
+                "Plugin response channel closed unexpectedly".to_string(),
+            )])),
+            Ok(Some(result)) => {
+                tracing::debug!("Sending to MCP: {result:?}");
+                match result {
+                    Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
+                    Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
+                }
+            }
         }
     }
 
-    async fn run_rojo_sourcemap(
-        &self,
-        args: RojoSourcemap,
-    ) -> Result<CallToolResult, ErrorData> {
+    async fn run_rojo_sourcemap(&self, args: RojoSourcemap) -> Result<CallToolResult, ErrorData> {
         let project_path = args
             .project_path
             .map(PathBuf::from)
@@ -609,14 +998,27 @@ pub async fn proxy_handler(
         state.process_queue.push_back(command);
         state.output_map.insert(id, tx);
     }
-    let result = rx.recv().await.ok_or_eyre("Couldn't receive response")?;
-    {
-        let mut state = state.lock().await;
-        state.output_map.remove_entry(&id);
-    }
-    let (success, response) = match result {
-        Ok(s) => (true, s),
-        Err(e) => (false, e.to_string()),
+    let guard = OutputMapGuard::new(state.clone(), id);
+    let recv_result = tokio::time::timeout(DEFAULT_TOOL_TIMEOUT, rx.recv()).await;
+    drop(guard);
+
+    let (success, response) = match recv_result {
+        Err(_) => {
+            {
+                let mut state = state.lock().await;
+                state.process_queue.retain(|cmd| cmd.id != Some(id));
+            }
+            (
+                false,
+                format!(
+                    "Proxy timed out after {}s waiting for plugin response",
+                    DEFAULT_TOOL_TIMEOUT.as_secs()
+                ),
+            )
+        }
+        Ok(None) => (false, "Proxy response channel closed".to_string()),
+        Ok(Some(Ok(s))) => (true, s),
+        Ok(Some(Err(e))) => (false, e.to_string()),
     };
     tracing::debug!("Sending back to dud: success={success}, response={response:?}");
     Ok(Json(RunCommandResponse {
@@ -633,31 +1035,142 @@ pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>) {
     while exit.is_empty() {
         let entry = { state.lock().await.process_queue.pop_front() };
         if let Some(entry) = entry {
+            // Guard against missing ids (shouldn't happen, but we don't want
+            // to panic the whole loop if it does).
+            let entry_id = match entry.id {
+                Some(id) => id,
+                None => {
+                    tracing::error!("dud_proxy_loop: dropping queue entry with no id");
+                    continue;
+                }
+            };
+
+            let tx = {
+                let mut s = state.lock().await;
+                s.output_map.remove(&entry_id)
+            };
+            let Some(tx) = tx else {
+                tracing::warn!(
+                    "dud_proxy_loop: no output sender for id {entry_id}; skipping entry"
+                );
+                continue;
+            };
+
             let res = client
                 .post(format!("http://127.0.0.1:{STUDIO_PLUGIN_PORT}/proxy"))
                 .json(&entry)
                 .send()
                 .await;
-            if let Ok(res) = res {
-                let tx = {
-                    state
-                        .lock()
-                        .await
-                        .output_map
-                        .remove(&entry.id.unwrap())
-                        .unwrap()
-                };
-                let res = res
+
+            let payload: Result<String> = match res {
+                Ok(res) => res
                     .json::<RunCommandResponse>()
                     .await
                     .map(|r| r.response)
-                    .map_err(Into::into);
-                tx.send(res).unwrap();
-            } else {
-                tracing::error!("Failed to proxy: {res:?}");
+                    .map_err(Into::into),
+                Err(e) => {
+                    tracing::error!("Failed to proxy: {e}");
+                    Err(e.into())
+                }
             };
-        } else {
-            waiter.changed().await.unwrap();
+
+            // Receiver may already be dropped (timeout on the MCP side);
+            // just log and move on.
+            if let Err(send_err) = tx.send(payload) {
+                tracing::debug!(
+                    "dud_proxy_loop: receiver dropped before response delivered: {send_err:?}"
+                );
+            }
+        } else if waiter.changed().await.is_err() {
+            // Sender dropped; we're shutting down.
+            tracing::debug!("dud_proxy_loop: waiter closed, exiting");
+            break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Tools that need the Studio plugin. Studio mode must keep serving exactly
+    /// these plus `CLOUD_TOOLS`; a new tool has to be added here on purpose.
+    const STUDIO_ONLY_TOOLS: [&str; 17] = [
+        "batch_apply",
+        "clear_console",
+        "get_asset_ids",
+        "get_console_output",
+        "get_instance_tree",
+        "get_properties",
+        "get_studio_mode",
+        "insert_model",
+        "mock_datastore",
+        "open_script",
+        "read_datastore",
+        "rojo_build",
+        "rojo_sourcemap",
+        "run_code",
+        "run_script_in_play_mode",
+        "select_instances",
+        "start_stop_play",
+    ];
+
+    fn server(mode: ServerMode) -> RBXStudioServer {
+        RBXStudioServer::new(
+            Arc::new(Mutex::new(AppState::new())),
+            Arc::new(TokenCache::new()),
+            None,
+            mode,
+        )
+    }
+
+    fn tool_names(server: &RBXStudioServer) -> BTreeSet<String> {
+        server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_mode_is_studio() {
+        assert_eq!(ServerMode::default(), ServerMode::Studio);
+    }
+
+    #[test]
+    fn studio_mode_lists_every_tool() {
+        let mut expected = names(&STUDIO_ONLY_TOOLS);
+        expected.extend(names(&CLOUD_TOOLS));
+        assert_eq!(tool_names(&server(ServerMode::Studio)), expected);
+    }
+
+    #[test]
+    fn cloud_mode_lists_only_the_cloud_tools() {
+        assert_eq!(tool_names(&server(ServerMode::Cloud)), names(&CLOUD_TOOLS));
+    }
+
+    #[test]
+    fn cloud_mode_removes_the_studio_routes() {
+        let cloud = server(ServerMode::Cloud);
+        for tool in STUDIO_ONLY_TOOLS {
+            assert!(!cloud.tool_router.has_route(tool), "{tool} still routable");
+        }
+        for tool in CLOUD_TOOLS {
+            assert!(cloud.tool_router.has_route(tool), "{tool} missing");
+        }
+    }
+
+    #[test]
+    fn cloud_mode_identifies_itself_as_cloud() {
+        let info = server(ServerMode::Cloud).get_info();
+        assert_eq!(info.server_info.name, "Roblox_Cloud");
+        let studio = server(ServerMode::Studio).get_info();
+        assert_eq!(studio.server_info.name, "Roblox_Studio");
     }
 }

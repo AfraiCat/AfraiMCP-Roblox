@@ -1,4 +1,5 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
+local PathResolver = require(Main.Utils.PathResolver)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
@@ -59,27 +60,19 @@ local function serializeInstance(
 	return result
 end
 
-local function resolvePath(path: string): Instance
-	if path == "" or path == "game" or path == "Game" then
-		return game
+local function safeEncode(value: any): string
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(value)
+	end)
+	if ok then
+		return encoded
 	end
-
-	local parts = string.split(path, ".")
-	local current: Instance = game
-
-	for i, part in parts do
-		if i == 1 and (part == "game" or part == "Game") then
-			current = game
-		else
-			local child = current:FindFirstChild(part)
-			if not child then
-				error("Instance not found: " .. path)
-			end
-			current = child
-		end
-	end
-
-	return current
+	-- Fallback so a weird value (NaN, inf, cycle) doesn't crash the whole
+	-- tool call.
+	return HttpService:JSONEncode({
+		_error = "json_encode_failed",
+		_reason = tostring(encoded),
+	})
 end
 
 local function handleGetInstanceTree(args: Types.GetInstanceTreeArgs): string?
@@ -87,13 +80,13 @@ local function handleGetInstanceTree(args: Types.GetInstanceTreeArgs): string?
 	local requestedDepth = if args.maxDepth and args.maxDepth > 0 then args.maxDepth else DEFAULT_MAX_DEPTH
 	local maxDepth = math.min(requestedDepth, MAX_DEPTH_CAP)
 
-	local rootInstance = resolvePath(rootPath)
+	local rootInstance = PathResolver.resolve(rootPath)
 	local nodeCount = { 0 }
 	local tree = serializeInstance(rootInstance, maxDepth, 0, nodeCount)
 
-	local json = HttpService:JSONEncode(tree)
+	local json = safeEncode(tree)
 	if #json > MAX_RESPONSE_BYTES then
-		return HttpService:JSONEncode({
+		return safeEncode({
 			_truncated = true,
 			_reason = "response_too_large",
 			_hint = "Use a narrower rootPath (e.g. Workspace.MyModel) or lower maxDepth",

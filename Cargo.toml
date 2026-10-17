@@ -14,10 +14,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.13", features = ["json"] }
+# multipart needed for the Open Cloud assets upload endpoint;
+# rustls so we don't pull in OpenSSL on Windows (reqwest 0.13 renamed the
+# `rustls-tls` feature to `rustls`).
+reqwest = { version = "0.13", features = ["json", "multipart", "form", "rustls"], default-features = false }
 color-eyre = "0.6"
 clap = { version = "4.5.37", features = ["derive"] }
 roblox_install = "1.0.0"
+# OAuth + Open Cloud
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+dirs = "5"
+open = "5"
+mime_guess = "2"
+urlencoding = "2"
+time = { version = "0.3", features = ["serde", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 native-dialog = "0.9"
