@@ -533,6 +533,9 @@ pub fn validate_upload(
 
 /// Validate a file for a content update of an existing asset. The docs support
 /// content updates for `.fbx` only; everything else is metadata-only.
+// Unused until the optional content-update step (plan step 6) comes back; the
+// path-based update tool was removed because it bypassed the upload policy.
+#[allow(dead_code)]
 pub fn validate_content_update(
     file_name: &str,
     bytes: &[u8],

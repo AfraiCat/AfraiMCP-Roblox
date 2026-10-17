@@ -28,7 +28,11 @@ rand = "0.8"
 dirs = "5"
 open = "5"
 urlencoding = "2"
-time = { version = "0.3", features = ["serde", "macros"] }
+time = { version = "0.3", features = ["serde", "macros", "formatting"] }
+# Upload policy: HMAC signature, glob rules, hex for signatures and hashes.
+hmac = "0.12"
+globset = "0.4"
+hex = "0.4"
 # Hidden prompt for `set-key` (the key is never a CLI argument or env var).
 rpassword = "7"
 

@@ -20,7 +20,9 @@ mod policy;
 mod rbx_studio_server;
 mod secret_store;
 mod token_store;
+mod upload_flow;
 
+use std::io::IsTerminal;
 use token_store::TokenCache;
 
 /// Simple MCP proxy for Roblox Studio
@@ -59,6 +61,23 @@ enum Command {
     AuthStatus,
     /// Import the old plaintext OAuth token file into secure storage, then ask before deleting it
     MigrateTokens,
+    /// Create, review and approve the signed upload policy (uploads stay off until you do)
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+    /// Check that the upload audit log has not been edited or truncated
+    AuditVerify,
+}
+
+#[derive(clap::Subcommand)]
+enum PolicyAction {
+    /// Write a template policy with everything switched off
+    Init,
+    /// Review the policy and approve it by typing SIGN (needs an interactive terminal)
+    Sign,
+    /// Show the policy and whether its signature is valid
+    Show,
 }
 
 async fn run_command(command: Command) -> Result<()> {
@@ -72,6 +91,20 @@ async fn run_command(command: Command) -> Result<()> {
             &mut io::stdin().lock(),
             &mut io::stdout().lock(),
         ),
+        Command::Policy { action } => {
+            let policy = cli::real_policy_store(store)?;
+            match action {
+                PolicyAction::Init => cli::policy_init(&policy, &mut io::stdout().lock()),
+                PolicyAction::Show => cli::policy_show(&policy, &mut io::stdout().lock()),
+                PolicyAction::Sign => cli::policy_sign(
+                    &policy,
+                    io::stdin().is_terminal(),
+                    &mut io::stdin().lock(),
+                    &mut io::stdout().lock(),
+                ),
+            }
+        }
+        Command::AuditVerify => cli::audit_verify(store, &mut io::stdout().lock()),
     }
 }
 
@@ -162,9 +195,19 @@ async fn main() -> Result<()> {
     let store = secret_store::default_store();
     tracing::info!("Secret storage backend: {}", store.backend());
     let token_cache = Arc::new(TokenCache::new(Arc::clone(&store)));
-    let auth = Arc::new(auth::AuthManager::new(store, token_cache));
+    let auth = Arc::new(auth::AuthManager::new(Arc::clone(&store), token_cache));
 
-    let service = RBXStudioServer::new(Arc::clone(&server_state), auth, args.mode)
+    // Uploads are gated by the signed policy, a confirmed plan and the audit
+    // log; without a signed, enabled policy every upload is refused.
+    let flow = Arc::new(upload_flow::UploadFlow::new(
+        policy::PolicyStore::new(policy::app_dir()?, Arc::clone(&store)),
+        Arc::new(audit::AuditLog::new(
+            audit::AuditLog::default_path()?,
+            Arc::clone(&store),
+        )),
+    ));
+
+    let service = RBXStudioServer::new(Arc::clone(&server_state), auth, flow, args.mode)
         .serve(rmcp::transport::stdio())
         .await
         .inspect_err(|e| {

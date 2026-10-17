@@ -1,8 +1,10 @@
+use crate::audit::AuditEntry;
 use crate::auth::AuthManager;
 use crate::error::{Report, Result};
 use crate::oauth;
-use crate::open_cloud::{OpenCloudClient, UploadArgs};
+use crate::open_cloud::OpenCloudClient;
 use crate::secret_store::redact;
+use crate::upload_flow::{ApprovedUpload, PlanRequest, UploadFlow};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
@@ -124,12 +126,13 @@ pub enum ServerMode {
 
 /// Tools that need no Studio plugin and stay available in `ServerMode::Cloud`.
 /// Everything else is removed from the tool router in that mode.
-pub const CLOUD_TOOLS: [&str; 7] = [
+pub const CLOUD_TOOLS: [&str; 8] = [
     "cloud_auth_status",
     "roblox_login",
     "roblox_logout",
+    "plan_upload",
     "upload_asset",
-    "update_asset",
+    "audit_log_tail",
     "get_asset_info",
     "list_my_assets",
 ];
@@ -142,6 +145,8 @@ pub struct RBXStudioServer {
     /// optional), resolved on every call. Without any credentials the tools
     /// return a setup hint instead of crashing.
     auth: Arc<AuthManager>,
+    /// Policy, plans, rate limit and audit log for uploads.
+    flow: Arc<UploadFlow>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -166,10 +171,11 @@ Only upload when the user asked for it in this conversation, and ask where to up
 - cloud_auth_status: Show which credentials are configured (never prints a secret). Check this first.
 - roblox_login: Optional OAuth sign-in. Opens a browser tab. Not needed with an API key.
 - roblox_logout: Clear locally stored OAuth tokens.
-- upload_asset: Upload a local file (Animation/Audio/Decal/Image/Mesh/Model/Video) to the user's account.
-- update_asset: Replace the contents of an existing asset by ID (.fbx files only).
+- plan_upload: Step 1. Check a local file against the user's signed upload policy; uploads nothing. Pass the creator (ask the user where to upload).
+- upload_asset: Step 2. Send a planned file to Roblox with planId, confirm and the exact confirmPhrase, only after the user agreed.
+- audit_log_tail: Recent upload audit entries and whether the log verifies.
 - get_asset_info: Read asset metadata by ID.
-- list_my_assets: Page through the logged-in user's inventory."
+- list_my_assets: Page through a user's inventory."
                         .to_string(),
                 ),
             };
@@ -197,13 +203,15 @@ Batch operations: use batch_apply to set properties on multiple instances (by ta
 Selection: use select_instances and open_script for Explorer/editor navigation.
 Rojo tools (rojo_sourcemap, rojo_build) run on host; require Rojo installed.
 
-OAuth-backed Open Cloud tools (require ROBLOX_OAUTH_CLIENT_ID / ROBLOX_OAUTH_CLIENT_SECRET env vars and a one-time roblox_login):
-- roblox_login: First-time / re-auth. Opens a browser tab.
-- roblox_logout: Revoke locally stored tokens.
-- upload_asset: Upload a local file (Animation/Audio/Decal/Image/Mesh/Model/Video) to the user's account.
-- update_asset: Replace the contents of an existing asset by ID (.fbx files only).
+Open Cloud tools (an API key stored with `rbx-studio-mcp set-key`, or optional OAuth). Only upload when the user asked for it in this conversation, and ask where to upload (personal account or a group) unless they already said:
+- cloud_auth_status: Show which credentials and upload policy are configured (never prints a secret).
+- roblox_login: Optional OAuth sign-in. Opens a browser tab.
+- roblox_logout: Revoke locally stored OAuth tokens.
+- plan_upload: Step 1. Check a local file against the signed upload policy; uploads nothing.
+- upload_asset: Step 2. Send a planned file with planId, confirm and the exact confirmPhrase, only after the user agreed.
+- audit_log_tail: Recent upload audit entries.
 - get_asset_info: Read asset metadata by ID.
-- list_my_assets: Page through the logged-in user's inventory.
+- list_my_assets: Page through a user's inventory.
 These tools live in the Rust process and do not require Roblox Studio to be running."
                     .to_string(),
             ),
@@ -359,7 +367,7 @@ fn cloud_error(message: String) -> CallToolResult {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct UploadAsset {
+struct PlanUpload {
     #[serde(rename = "filePath")]
     #[schemars(description = "Absolute path to the local file to upload. Max 20MB.")]
     file_path: String,
@@ -371,29 +379,51 @@ struct UploadAsset {
     #[serde(rename = "displayName")]
     #[schemars(description = "Display name shown on the Roblox catalog page")]
     display_name: String,
-    #[schemars(description = "Optional description")]
+    #[schemars(description = "Optional description (up to 1000 characters)")]
     description: Option<String>,
-    /// Override the creator. Defaults to the logged-in user.
-    #[serde(rename = "userId")]
     #[schemars(
-        description = "Optional override: upload under this user ID (defaults to current user)"
+        description = "Where to upload, as a creator alias from the user's policy (for example 'personal' or a group name). Give exactly one of creator, userId or groupId. If the user has not said where to upload, ask them first."
     )]
+    creator: Option<String>,
+    #[serde(rename = "userId")]
+    #[schemars(description = "Upload under this numeric user ID (personal account)")]
     user_id: Option<String>,
     #[serde(rename = "groupId")]
-    #[schemars(
-        description = "Optional override: upload under this group ID. Mutually exclusive with userId."
-    )]
+    #[schemars(description = "Upload under this numeric group ID")]
     group_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct UpdateAsset {
-    #[serde(rename = "assetId")]
-    #[schemars(description = "ID of the existing asset to update")]
-    asset_id: String,
-    #[serde(rename = "filePath")]
-    #[schemars(description = "Absolute path to the new local .fbx file. Max 20MB.")]
-    file_path: String,
+struct UploadAsset {
+    #[serde(rename = "planId")]
+    #[schemars(description = "The planId returned by plan_upload")]
+    plan_id: String,
+    #[schemars(
+        description = "Must be true, and only after the user agreed to the exact upload in the plan summary"
+    )]
+    confirm: bool,
+    #[serde(rename = "confirmPhrase")]
+    #[schemars(description = "The confirmPhrase from the plan, copied exactly")]
+    confirm_phrase: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct AuditLogTail {
+    #[schemars(description = "How many of the newest entries to return (1-200, default 20)")]
+    count: Option<u32>,
+}
+
+fn approved_entry(event: &str, approved: &ApprovedUpload) -> AuditEntry {
+    AuditEntry {
+        event: event.to_string(),
+        plan_id: Some(approved.plan_id.clone()),
+        path: Some(approved.path.display().to_string()),
+        sha256: Some(approved.sha256.clone()),
+        bytes: Some(approved.bytes.len() as u64),
+        asset_type: Some(approved.kind.api_name().to_string()),
+        creator: Some(approved.creator.describe()),
+        ..Default::default()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
@@ -464,7 +494,12 @@ enum ToolArgumentValues {
 }
 #[tool_router]
 impl RBXStudioServer {
-    pub fn new(state: PackedState, auth: Arc<AuthManager>, mode: ServerMode) -> Self {
+    pub fn new(
+        state: PackedState,
+        auth: Arc<AuthManager>,
+        flow: Arc<UploadFlow>,
+        mode: ServerMode,
+    ) -> Self {
         let mut tool_router = Self::tool_router();
         if mode == ServerMode::Cloud {
             // Removing the routes (not just hiding them in the list) also makes
@@ -479,6 +514,7 @@ impl RBXStudioServer {
             mode,
             state,
             auth,
+            flow,
             tool_router,
         }
     }
@@ -727,44 +763,121 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Upload a local file to Roblox as a new asset. Pass userId (personal account) or groupId as the creator; an API key has no default account, so ask the user where to upload unless they already said. assetType is one of Animation, Audio, Decal, Image, Mesh, Model, Video; the file extension and content must match it (see assetType). Returns the resolved asset metadata including assetId on success."
+        description = "Step 1 of uploading a local file to Roblox: check it against the user's signed upload policy and return a plan. Uploads nothing. Only use when the user asked for an upload in this conversation. Pass creator (a policy alias such as 'personal'), or userId, or groupId; if the user has not said where to upload (their personal account or a group), ask them first. assetType is one of Animation, Audio, Decal, Image, Mesh, Model, Video; the file extension and content must match it. Show the returned summary to the user, and only after they agree call upload_asset with planId, confirm: true and confirmPhrase exactly as returned."
+    )]
+    async fn plan_upload(
+        &self,
+        Parameters(args): Parameters<PlanUpload>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let flow = self.flow.clone();
+        let request = PlanRequest {
+            file_path: args.file_path,
+            asset_type: args.asset_type,
+            display_name: args.display_name,
+            description: args.description,
+            creator: args.creator,
+            user_id: args.user_id,
+            group_id: args.group_id,
+        };
+        // Reading and hashing a file (up to 20 MB) is blocking work.
+        match tokio::task::spawn_blocking(move || flow.plan(request)).await {
+            Ok(Ok(summary)) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&summary).unwrap_or_default(),
+            )])),
+            Ok(Err(e)) => Ok(cloud_error(e.to_string())),
+            Err(e) => Ok(cloud_error(format!("plan_upload failed: {e}"))),
+        }
+    }
+
+    #[tool(
+        description = "Step 2 of uploading: send the file named by a plan from plan_upload to Roblox. Needs planId, confirm: true and the exact confirmPhrase from the plan, and only after the user agreed to that exact upload. Plans are single use and expire after 10 minutes. Returns the asset ID and moderation state; use insert_asset in Studio to bring it into a place."
     )]
     async fn upload_asset(
         &self,
         Parameters(args): Parameters<UploadAsset>,
     ) -> Result<CallToolResult, ErrorData> {
+        let flow = self.flow.clone();
+        let (plan_id, confirm, phrase) = (args.plan_id, args.confirm, args.confirm_phrase);
+        let approved =
+            match tokio::task::spawn_blocking(move || flow.approve(&plan_id, confirm, &phrase))
+                .await
+            {
+                Ok(Ok(approved)) => approved,
+                Ok(Err(e)) => return Ok(cloud_error(format!("Upload refused: {e}"))),
+                Err(e) => return Ok(cloud_error(format!("Upload failed: {e}"))),
+            };
+
         let client = self.open_cloud();
-        let upload = UploadArgs {
-            file_path: args.file_path,
-            asset_type: args.asset_type,
-            display_name: args.display_name,
-            description: args.description,
-            user_id: args.user_id,
-            group_id: args.group_id,
-            poll_timeout_secs: None,
+        let operation = match client.start_upload(&approved).await {
+            Ok(path) => path,
+            Err(e) => {
+                let mut entry = approved_entry("upload_failed", &approved);
+                entry.detail = Some(e.to_string());
+                let _ = self.flow.record(entry);
+                return Ok(cloud_error(format!("Upload failed: {e}")));
+            }
         };
-        match client.upload_asset(upload).await {
-            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
-            )])),
-            Err(e) => Ok(cloud_error(format!("Upload failed: {e}"))),
+
+        // The asset may exist from here on, so record the operation before polling.
+        let mut started = approved_entry("upload_started", &approved);
+        started.operation = Some(operation.clone());
+        let audit_warning = self.flow.record(started).err();
+
+        let outcome = client.finish_operation(&operation, 60).await;
+        let mut finished = approved_entry("upload_finished", &approved);
+        finished.operation = Some(operation.clone());
+        let result = match outcome {
+            Ok(response) => {
+                let asset_id = response["assetId"].as_str().map(str::to_string);
+                let moderation = response["moderationResult"]["moderationState"]
+                    .as_str()
+                    .map(str::to_string);
+                finished.asset_id = asset_id.clone();
+                finished.status = moderation.clone().or_else(|| Some("done".to_string()));
+                let body = serde_json::json!({
+                    "assetId": asset_id,
+                    "moderationState": moderation,
+                    "operation": operation,
+                    "creator": approved.creator.describe(),
+                    "assetType": approved.kind.api_name(),
+                    "next": "Use insert_asset (official Studio MCP) with this assetId to bring it into a place.",
+                    "auditWarning": audit_warning.as_ref().map(|e| e.to_string()),
+                    "response": response,
+                });
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&body).unwrap_or_default(),
+                )])
+            }
+            Err(e) => {
+                finished.event = "upload_failed".to_string();
+                finished.detail = Some(e.to_string());
+                cloud_error(format!(
+                    "Upload started (operation {operation}) but did not complete: {e}"
+                ))
+            }
+        };
+        if let Err(e) = self.flow.record(finished) {
+            tracing::error!("could not record the upload result in the audit log: {e}");
         }
+        Ok(result)
     }
 
     #[tool(
-        description = "Replace the contents of an existing asset (by assetId) with the bytes of a local .fbx file; Roblox currently supports content updates for .fbx only. The asset type stays the same. Returns the updated asset metadata."
+        description = "Show the newest entries of the upload audit log (plans, approvals, denials, uploads) and whether the hash chain still verifies. Never contains secrets."
     )]
-    async fn update_asset(
+    async fn audit_log_tail(
         &self,
-        Parameters(args): Parameters<UpdateAsset>,
+        Parameters(args): Parameters<AuditLogTail>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = self.open_cloud();
-        let path = std::path::PathBuf::from(&args.file_path);
-        match client.update_asset_content(&args.asset_id, &path, 60).await {
-            Ok(v) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+        let count = args.count.unwrap_or(20).clamp(1, 200) as usize;
+        match self.flow.audit().tail(count) {
+            Ok((records, chain)) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(
+                    &serde_json::json!({ "chain": chain, "records": records }),
+                )
+                .unwrap_or_default(),
             )])),
-            Err(e) => Ok(cloud_error(format!("Update failed: {e}"))),
+            Err(e) => Ok(cloud_error(format!("audit_log_tail failed: {e}"))),
         }
     }
 
@@ -813,7 +926,8 @@ impl RBXStudioServer {
         &self,
         Parameters(_args): Parameters<CloudAuthStatus>,
     ) -> Result<CallToolResult, ErrorData> {
-        let status = self.auth.status().await;
+        let mut status = self.auth.status().await;
+        status["uploadPolicy"] = self.flow.policy_status();
         Ok(CallToolResult::success(vec![Content::text(redact(
             &serde_json::to_string_pretty(&status).unwrap_or_else(|_| status.to_string()),
         ))]))
@@ -1113,13 +1227,22 @@ mod tests {
     ];
 
     fn server(mode: ServerMode) -> RBXStudioServer {
+        use crate::audit::AuditLog;
+        use crate::policy::PolicyStore;
         use crate::secret_store::{MemoryStore, SecretStore};
         use crate::token_store::TokenCache;
         let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
         let cache = Arc::new(TokenCache::new(store.clone()));
+        // An empty temp folder: no policy exists, so uploads are off.
+        let dir = std::env::temp_dir().join(format!("rbx-srv-{}", uuid::Uuid::new_v4()));
+        let flow = Arc::new(UploadFlow::new(
+            PolicyStore::new(dir.clone(), store.clone()),
+            Arc::new(AuditLog::new(dir.join("uploads.jsonl"), store.clone())),
+        ));
         RBXStudioServer::new(
             Arc::new(Mutex::new(AppState::new())),
             Arc::new(AuthManager::new(store, cache)),
+            flow,
             mode,
         )
     }
@@ -1165,10 +1288,74 @@ mod tests {
     }
 
     #[test]
-    fn cloud_tools_are_the_documented_seven_and_studio_adds_seventeen() {
-        assert_eq!(CLOUD_TOOLS.len(), 7);
-        assert_eq!(tool_names(&server(ServerMode::Studio)).len(), 24);
-        assert_eq!(tool_names(&server(ServerMode::Cloud)).len(), 7);
+    fn cloud_tools_are_the_documented_eight_and_studio_adds_seventeen() {
+        assert_eq!(CLOUD_TOOLS.len(), 8);
+        assert_eq!(tool_names(&server(ServerMode::Studio)).len(), 25);
+        assert_eq!(tool_names(&server(ServerMode::Cloud)).len(), 8);
+    }
+
+    #[test]
+    fn no_tool_uploads_from_a_path_or_updates_an_asset_without_the_flow() {
+        let s = server(ServerMode::Cloud);
+        assert!(!tool_names(&s).contains("update_asset"));
+        let upload = s
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "upload_asset")
+            .unwrap();
+        let schema = serde_json::to_string(&upload).unwrap();
+        for field in ["planId", "confirm", "confirmPhrase"] {
+            assert!(schema.contains(field), "{field} missing: {schema}");
+        }
+        for forbidden in ["filePath", "userId", "groupId", "assetType"] {
+            assert!(!schema.contains(forbidden), "{forbidden} present: {schema}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_asset_without_a_plan_is_refused_before_any_network_call() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .upload_asset(Parameters(UploadAsset {
+                plan_id: "made-up".to_string(),
+                confirm: true,
+                confirm_phrase: "UPLOAD anything".to_string(),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("unknown or already used"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn plan_upload_without_a_policy_explains_how_to_create_one() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .plan_upload(Parameters(PlanUpload {
+                file_path: "C:/anything.glb".to_string(),
+                asset_type: "Model".to_string(),
+                display_name: "x".to_string(),
+                description: None,
+                creator: Some("personal".to_string()),
+                user_id: None,
+                group_id: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("policy init"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_audit_tail_works_on_an_empty_log() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .audit_log_tail(Parameters(AuditLogTail { count: None }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("records"), "{text}");
     }
 
     fn tool_names(server: &RBXStudioServer) -> BTreeSet<String> {
@@ -1217,7 +1404,7 @@ mod tests {
         use crate::asset_types::AssetKind;
         for mode in [ServerMode::Studio, ServerMode::Cloud] {
             let s = server(mode);
-            for name in ["upload_asset", "update_asset"] {
+            for name in ["plan_upload"] {
                 let tool = s
                     .tool_router
                     .list_all()
@@ -1227,7 +1414,7 @@ mod tests {
                 let text = serde_json::to_string(&tool).unwrap();
                 assert!(!text.contains("ModelFromFbx"), "{name}: {text}");
                 assert!(!text.contains("MeshPart"), "{name}: {text}");
-                if name == "upload_asset" {
+                if name == "plan_upload" {
                     for kind in AssetKind::ALL {
                         assert!(text.contains(kind.api_name()), "{name} lacks {kind}");
                     }

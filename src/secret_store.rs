@@ -26,6 +26,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const API_KEY: &str = "open-cloud-api-key";
 pub const OAUTH_CLIENT_SECRET: &str = "oauth-client-secret";
 pub const OAUTH_TOKENS: &str = "oauth-tokens";
+/// HMAC key that signs the upload policy; created by `policy init`/`policy sign`.
+pub const POLICY_KEY: &str = "upload-policy-hmac-key";
+/// `seq:hash` of the newest audit line, so a truncated or replaced log is noticed.
+pub const AUDIT_HEAD: &str = "audit-head";
 
 const REDACTED: &str = "[REDACTED]";
 

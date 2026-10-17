@@ -6,13 +6,19 @@
 //! caller (Roblox's API error bodies are not always self-explanatory) and to
 //! handle the asynchronous upload pattern: POST kicks off an operation, then we
 //! poll for completion.
+//!
+//! There is deliberately no function here that uploads a file from a path:
+//! [`OpenCloudClient::start_upload`] only accepts an [`ApprovedUpload`], which
+//! the upload flow creates after the signed policy, the confirmed plan, the
+//! rate limit and the file hash all check out.
 
-use crate::asset_types::{self, AssetKind, ValidatedFile};
+use crate::asset_types::ValidatedFile;
 use crate::auth::AuthManager;
+use crate::policy::Creator as PolicyCreator;
+use crate::upload_flow::ApprovedUpload;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -27,6 +33,21 @@ struct Creator {
     user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "groupId")]
     group_id: Option<String>,
+}
+
+impl From<&PolicyCreator> for Creator {
+    fn from(creator: &PolicyCreator) -> Self {
+        match creator {
+            PolicyCreator::User(id) => Creator {
+                user_id: Some(id.clone()),
+                group_id: None,
+            },
+            PolicyCreator::Group(id) => Creator {
+                user_id: None,
+                group_id: Some(id.clone()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -76,55 +97,26 @@ impl OpenCloudClient {
         self.auth.user_id().await
     }
 
-    /// Upload a new asset from a local file. Blocks until the operation
-    /// completes (or `poll_timeout` elapses), returning the new asset
-    /// metadata.
-    pub async fn upload_asset(&self, args: UploadArgs) -> Result<serde_json::Value> {
-        let kind = AssetKind::parse(&args.asset_type)?;
-        let path = PathBuf::from(&args.file_path);
-        let file_meta = tokio::fs::metadata(&path)
-            .await
-            .wrap_err_with(|| format!("Reading file metadata for {}", path.display()))?;
-        asset_types::validate_size(kind, file_meta.len())?;
-
-        let creator = match (args.group_id.as_deref(), args.user_id.as_deref()) {
-            (Some(_), Some(_)) => {
-                return Err(eyre!(
-                    "Pass either userId or groupId, not both. Omit both to upload as the \
-                     currently-logged-in user."
-                ));
-            }
-            (Some(g), None) => Creator {
-                user_id: None,
-                group_id: Some(g.to_string()),
-            },
-            (None, Some(u)) => Creator {
-                user_id: Some(u.to_string()),
-                group_id: None,
-            },
-            (None, None) => Creator {
-                user_id: Some(self.user_id().await?),
-                group_id: None,
-            },
-        };
-
+    /// Send the create request for an approved upload and return the
+    /// operation path (`operations/<id>`). The caller records the path in the
+    /// audit log before polling. The create POST is never retried: a retry
+    /// could create the asset twice.
+    pub async fn start_upload(&self, approved: &ApprovedUpload) -> Result<String> {
         let request_json = serde_json::to_string(&UploadRequest {
-            asset_type: kind.api_name().to_string(),
-            display_name: args.display_name.clone(),
-            description: args.description.clone().unwrap_or_default(),
-            creation_context: CreationContext { creator },
+            asset_type: approved.kind.api_name().to_string(),
+            display_name: approved.display_name.clone(),
+            description: approved.description.clone(),
+            creation_context: CreationContext {
+                creator: Creator::from(&approved.creator.creator),
+            },
         })?;
-
-        let bytes = tokio::fs::read(&path)
-            .await
-            .wrap_err_with(|| format!("Reading file {}", path.display()))?;
-        let file = asset_types::validate_upload(kind, &path.to_string_lossy(), &bytes)?;
 
         // Roblox's multipart form expects exactly two fields: "request" (JSON
         // metadata as a plain text part) and "fileContent" (the file).
-        let form = multipart::Form::new()
-            .text("request", request_json)
-            .part("fileContent", file_part(&file, bytes)?);
+        let form = multipart::Form::new().text("request", request_json).part(
+            "fileContent",
+            file_part(&approved.validated, approved.bytes.clone())?,
+        );
 
         let url = format!("{ASSETS_BASE}/assets");
         let resp = self
@@ -145,59 +137,12 @@ impl OpenCloudClient {
         }
         let op: OperationResponse = serde_json::from_str(&body)
             .wrap_err_with(|| format!("Parsing operation response: {body}"))?;
-
-        self.poll_operation(&op.path, args.poll_timeout_secs.unwrap_or(60))
-            .await
-    }
-
-    /// Update the binary contents of an existing asset. Used by `update_asset`.
-    pub async fn update_asset_content(
-        &self,
-        asset_id: &str,
-        file_path: &Path,
-        poll_timeout_secs: u64,
-    ) -> Result<serde_json::Value> {
-        let meta = tokio::fs::metadata(file_path)
-            .await
-            .wrap_err_with(|| format!("Reading file metadata for {}", file_path.display()))?;
-        asset_types::validate_size(AssetKind::Model, meta.len())?;
-        let bytes = tokio::fs::read(file_path)
-            .await
-            .wrap_err_with(|| format!("Reading file {}", file_path.display()))?;
-        let file = asset_types::validate_content_update(&file_path.to_string_lossy(), &bytes)?;
-
-        // Per the Roblox docs, content updates use the same multipart shape
-        // (just no creationContext) against PATCH /assets/{id}.
-        let request_json = serde_json::json!({}).to_string();
-        let form = multipart::Form::new()
-            .text("request", request_json)
-            .part("fileContent", file_part(&file, bytes)?);
-
-        let url = format!("{ASSETS_BASE}/assets/{asset_id}");
-        let resp = self
-            .auth
-            .apply(self.http.patch(&url))
-            .await?
-            .multipart(form)
-            .send()
-            .await
-            .wrap_err("PATCH /assets/v1/assets/{id}")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(eyre!(
-                "Asset update failed ({status}): {body}. The asset must be owned by the \
-                 authorized user/group, and you must hold asset:write."
-            ));
-        }
-        let op: OperationResponse = serde_json::from_str(&body)
-            .wrap_err_with(|| format!("Parsing operation response: {body}"))?;
-        self.poll_operation(&op.path, poll_timeout_secs).await
+        Ok(op.path)
     }
 
     /// Poll the operations endpoint until `done=true`, returning the final
     /// `response` object (or surfacing the `error` object).
-    async fn poll_operation(
+    pub async fn finish_operation(
         &self,
         operation_path: &str,
         timeout_secs: u64,
@@ -312,13 +257,37 @@ fn file_part(file: &ValidatedFile, bytes: Vec<u8>) -> Result<multipart::Part> {
         .wrap_err("Building multipart file part")
 }
 
-pub struct UploadArgs {
-    pub file_path: String,
-    pub asset_type: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    /// Override creator. Defaults to the logged-in user.
-    pub user_id: Option<String>,
-    pub group_id: Option<String>,
-    pub poll_timeout_secs: Option<u64>,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Creator as C;
+
+    #[test]
+    fn the_creator_is_serialized_as_exactly_one_id() {
+        let user = serde_json::to_value(Creator::from(&C::User("1".into()))).unwrap();
+        assert_eq!(user, serde_json::json!({ "userId": "1" }));
+        let group = serde_json::to_value(Creator::from(&C::Group("2".into()))).unwrap();
+        assert_eq!(group, serde_json::json!({ "groupId": "2" }));
+    }
+
+    #[test]
+    fn the_request_json_matches_the_documented_shape() {
+        let request = UploadRequest {
+            asset_type: "Model".into(),
+            display_name: "Fox".into(),
+            description: String::new(),
+            creation_context: CreationContext {
+                creator: Creator::from(&C::User("111".into())),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "assetType": "Model",
+                "displayName": "Fox",
+                "description": "",
+                "creationContext": { "creator": { "userId": "111" } }
+            })
+        );
+    }
 }
