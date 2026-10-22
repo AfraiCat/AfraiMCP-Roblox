@@ -23,6 +23,7 @@
 //! be registered exactly in the Creator Dashboard. We use a single fixed
 //! port (`OAUTH_CALLBACK_PORT`) so users only need to register one URI.
 
+use crate::secret_store::{Secret, SecretStore, OAUTH_CLIENT_SECRET};
 use crate::token_store::{StoredTokens, TokenCache};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -44,32 +45,39 @@ const USERINFO_URL: &str = "https://apis.roblox.com/oauth/v1/userinfo";
 const DEFAULT_SCOPES: &str = "openid profile asset:read asset:write";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes for the user to authorize
 
-/// Credentials read from the environment at startup. Cloned into every
-/// HTTP request that needs them.
+/// OAuth app credentials. The client id is not a secret and comes from
+/// `ROBLOX_OAUTH_CLIENT_ID`; the client secret is read from the secret store
+/// (store it with `rbx-studio-mcp set-key --kind oauth-client-secret`), never
+/// from an environment variable or MCP config. `Debug` prints no secret.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Secret,
 }
 
 impl OAuthConfig {
-    /// Read `ROBLOX_OAUTH_CLIENT_ID` and `ROBLOX_OAUTH_CLIENT_SECRET` from the
-    /// environment. Returns `None` if either is unset so the rest of the MCP
-    /// can still run for users who don't need upload tools.
-    pub fn from_env() -> Option<Self> {
-        let client_id = std::env::var("ROBLOX_OAUTH_CLIENT_ID").ok()?;
-        let client_secret = std::env::var("ROBLOX_OAUTH_CLIENT_SECRET").ok()?;
-        if client_id.trim().is_empty() || client_secret.trim().is_empty() {
-            return None;
-        }
-        Some(Self {
+    /// Load the OAuth app credentials. The error says what is missing so the
+    /// caller can tell the user how to set it up.
+    pub fn load(store: &dyn SecretStore) -> Result<Self> {
+        let client_id = std::env::var("ROBLOX_OAUTH_CLIENT_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| eyre!("ROBLOX_OAUTH_CLIENT_ID is not set (OAuth is optional; an API key is the default)"))?;
+        let client_secret = store.get(OAUTH_CLIENT_SECRET)?.ok_or_else(|| {
+            eyre!(
+                "no OAuth client secret is stored; run `rbx-studio-mcp set-key --kind \
+                 oauth-client-secret` in a terminal"
+            )
+        })?;
+        Ok(Self {
             client_id,
             client_secret,
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: String,
@@ -242,7 +250,7 @@ async fn exchange_code(
         ("code", code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", config.client_id.as_str()),
-        ("client_secret", config.client_secret.as_str()),
+        ("client_secret", config.client_secret.expose()),
         ("code_verifier", code_verifier),
     ];
 
@@ -359,7 +367,7 @@ async fn refresh(
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", config.client_id.as_str()),
-        ("client_secret", config.client_secret.as_str()),
+        ("client_secret", config.client_secret.expose()),
     ];
     let resp = http.post(TOKEN_URL).form(&form).send().await?;
     let status = resp.status();
