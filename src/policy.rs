@@ -140,6 +140,14 @@ fn default_rate() -> u32 {
     10
 }
 
+/// Default and hard limits for `max_batch_files`.
+pub const DEFAULT_MAX_BATCH_FILES: u32 = 25;
+pub const MAX_BATCH_FILES_CEILING: u32 = 200;
+
+fn default_max_batch_files() -> u32 {
+    DEFAULT_MAX_BATCH_FILES
+}
+
 /// The policy document. Unknown fields are rejected so a typo can never
 /// silently fall back to a default. Every default is the safe one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +177,11 @@ pub struct Policy {
     pub allow_unlisted_creators: bool,
     #[serde(default = "default_rate")]
     pub rate_limit_per_minute: u32,
+    /// Most files one batch upload may contain (1-200). Optional: a policy
+    /// signed before batch mode existed keeps working with the default. Every
+    /// other rule of the policy still applies to each file of a batch.
+    #[serde(default = "default_max_batch_files")]
+    pub max_batch_files: u32,
 }
 
 impl Policy {
@@ -188,6 +201,7 @@ impl Policy {
             default_creator: None,
             allow_unlisted_creators: true,
             rate_limit_per_minute: default_rate(),
+            max_batch_files: default_max_batch_files(),
         }
     }
 
@@ -231,6 +245,11 @@ impl Policy {
             return Err(PolicyError::Invalid(
                 "rate_limit_per_minute must be between 1 and 600".into(),
             ));
+        }
+        if self.max_batch_files == 0 || self.max_batch_files > MAX_BATCH_FILES_CEILING {
+            return Err(PolicyError::Invalid(format!(
+                "max_batch_files must be between 1 and {MAX_BATCH_FILES_CEILING}"
+            )));
         }
         Ok(())
     }
@@ -293,6 +312,113 @@ impl Policy {
             ));
         }
         Ok(canonical)
+    }
+
+    /// Resolve a folder and check it sits inside an allowed root (the folder
+    /// may itself be a root). Used by batch uploads before listing it.
+    pub fn check_folder(&self, folder: &Path) -> Result<PathBuf, PolicyError> {
+        let canonical = std::fs::canonicalize(folder).map_err(|e| {
+            PolicyError::Denied(format!("cannot resolve the folder ({:?})", e.kind()))
+        })?;
+        if !canonical.is_dir() {
+            return Err(PolicyError::Denied("the path is not a folder".into()));
+        }
+        let mut roots = Vec::with_capacity(self.allowed_roots.len());
+        for root in &self.allowed_roots {
+            roots.push(Self::matcher(root)?);
+        }
+        let inside = canonical
+            .ancestors()
+            .map(normalize)
+            .any(|ancestor| roots.iter().any(|r| r.is_match(&ancestor)));
+        if !inside {
+            return Err(PolicyError::Denied(
+                "the folder is outside every allowed_roots folder".into(),
+            ));
+        }
+        Ok(canonical)
+    }
+
+    /// List the files under `folder` (already checked with [`check_folder`])
+    /// whose path relative to it matches `pattern` (`/` separators; `*.png`
+    /// matches the top level only, `**/*.png` also sub-folders). The result is
+    /// sorted. Symlinks are never followed into folders, and a file symlink
+    /// whose target resolves outside the folder is reported in `skipped`, not
+    /// listed. Every listed file still goes through [`check_path`] later.
+    pub fn expand_folder(
+        &self,
+        folder: &Path,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<FolderListing, PolicyError> {
+        const MAX_DEPTH: usize = 12;
+        const MAX_ENTRIES: usize = 20_000;
+        let matcher = Self::matcher(pattern)?;
+        let root = std::fs::canonicalize(folder).map_err(|e| {
+            PolicyError::Denied(format!("cannot resolve the folder ({:?})", e.kind()))
+        })?;
+        let io = |e: std::io::Error| {
+            PolicyError::Denied(format!("cannot list the folder ({:?})", e.kind()))
+        };
+        let mut found = std::collections::BTreeSet::new();
+        let mut skipped = Vec::new();
+        let mut visited = 0usize;
+        let mut stack = vec![(root.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(io)? {
+                let entry = entry.map_err(io)?;
+                visited += 1;
+                if visited > MAX_ENTRIES {
+                    return Err(PolicyError::Denied(format!(
+                        "the folder holds more than {MAX_ENTRIES} entries; use a narrower folder"
+                    )));
+                }
+                let kind = entry.file_type().map_err(io)?;
+                let path = entry.path();
+                let candidate = if kind.is_symlink() {
+                    match std::fs::canonicalize(&path) {
+                        Ok(target) if !target.starts_with(&root) => {
+                            skipped.push((
+                                normalize(&path),
+                                "a symlink that resolves outside the folder".to_string(),
+                            ));
+                            continue;
+                        }
+                        Ok(target) if target.is_file() => target,
+                        Ok(_) => continue, // symlinked folders are not followed
+                        Err(_) => {
+                            skipped.push((normalize(&path), "a broken symlink".to_string()));
+                            continue;
+                        }
+                    }
+                } else if kind.is_dir() {
+                    if depth < MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                } else if kind.is_file() {
+                    path
+                } else {
+                    continue;
+                };
+                let Ok(relative) = candidate.strip_prefix(&root) else {
+                    continue;
+                };
+                if matcher.is_match(normalize(relative)) {
+                    found.insert(normalize(&candidate));
+                    if found.len() > limit {
+                        return Err(PolicyError::Denied(format!(
+                            "the glob matches more than {limit} files (max_batch_files); \
+                             narrow the glob or split the batch"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(FolderListing {
+            files: found.into_iter().map(PathBuf::from).collect(),
+            skipped,
+        })
     }
 
     /// Is this creator acceptable under the policy (listed, or unlisted ones allowed)?
@@ -395,6 +521,15 @@ impl Policy {
     }
 }
 
+/// What [`Policy::expand_folder`] found.
+#[derive(Debug, Default)]
+pub struct FolderListing {
+    /// Matching files, sorted, as normalized (`/`) paths.
+    pub files: Vec<PathBuf>,
+    /// Entries left out on purpose, as (path, reason).
+    pub skipped: Vec<(String, String)>,
+}
+
 /// `C:/dir/file` form: forward slashes, no `\\?\` prefix.
 fn normalize(path: &Path) -> String {
     let s = path.to_string_lossy().replace('\\', "/");
@@ -472,6 +607,7 @@ pub struct PolicySummary {
     pub allow_unlisted_creators: bool,
     pub max_bytes: u64,
     pub rate_limit_per_minute: u32,
+    pub max_batch_files: u32,
 }
 
 impl From<&Policy> for PolicySummary {
@@ -489,6 +625,7 @@ impl From<&Policy> for PolicySummary {
             allow_unlisted_creators: p.allow_unlisted_creators,
             max_bytes: p.max_bytes,
             rate_limit_per_minute: p.rate_limit_per_minute,
+            max_batch_files: p.max_batch_files,
         }
     }
 }
@@ -855,15 +992,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "needs Developer Mode or elevation to create symlinks"]
     fn a_symlink_out_of_the_root_is_refused() {
         let dir = temp_dir("policy-link");
         let outside_dir = temp_dir("policy-link-out");
         let target = write_file(&outside_dir, "secret.glb", b"x");
         fs::create_dir_all(dir.join("exports")).unwrap();
-        if std::os::windows::fs::symlink_file(&target, dir.join("exports/link.glb")).is_err() {
-            eprintln!("skipped: creating symlinks needs Developer Mode or elevation");
-            return;
-        }
+        std::os::windows::fs::symlink_file(&target, dir.join("exports/link.glb"))
+            .expect("creating symlinks needs Developer Mode or elevation");
         let (store, pdir, _) =
             signed_store(&policy_json(&format!("{}/exports", root_of(&dir)), ""));
         let policy = store.load_enabled().unwrap();
@@ -943,5 +1079,203 @@ mod tests {
         assert!(policy.resolve_creator(None, Some("111"), None).is_ok());
         assert!(!policy.permits_creator(&Creator::Group("999".into())));
         let _ = fs::remove_dir_all(pdir);
+    }
+
+    #[test]
+    fn a_policy_without_max_batch_files_still_loads_with_the_default() {
+        // The exact shape a policy signed before batch mode existed has.
+        let (store, pdir, _) = signed_store(
+            r#"{ "enabled": true, "allowed_roots": ["C:/x"], "rate_limit_per_minute": 5 }"#,
+        );
+        let policy = store.load_enabled().unwrap();
+        assert_eq!(policy.max_batch_files, DEFAULT_MAX_BATCH_FILES);
+        assert_eq!(PolicySummary::from(&*policy).max_batch_files, 25);
+        let _ = fs::remove_dir_all(pdir);
+    }
+
+    #[test]
+    fn max_batch_files_is_limited_to_1_through_200() {
+        for (value, ok) in [(0, false), (1, true), (200, true), (201, false)] {
+            let dir = temp_dir("policy-batch-limit");
+            let secrets: Arc<dyn SecretStore> = Arc::new(crate::secret_store::MemoryStore::new());
+            let store = PolicyStore::new(dir.clone(), secrets);
+            fs::write(
+                store.policy_path(),
+                format!(r#"{{ "max_batch_files": {value} }}"#),
+            )
+            .unwrap();
+            assert_eq!(store.sign().is_ok(), ok, "{value}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn folders_must_sit_inside_an_allowed_root() {
+        let dir = temp_dir("policy-folder");
+        write_file(&dir, "exports/a.png", b"x");
+        write_file(&dir, "elsewhere/b.png", b"x");
+        let root = format!("{}/exports", root_of(&dir));
+        let (store, pdir, _) = signed_store(&policy_json(&root, ""));
+        let policy = store.load_enabled().unwrap();
+        assert!(policy.check_folder(&dir.join("exports")).is_ok());
+        assert!(policy.check_folder(&dir.join("elsewhere")).is_err());
+        assert!(policy.check_folder(&dir.join("exports/a.png")).is_err());
+        assert!(policy.check_folder(&dir.join("missing")).is_err());
+        // A parent of the root is not inside it.
+        assert!(policy.check_folder(&dir).is_err());
+        for d in [dir, pdir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn expanding_a_folder_is_sorted_and_respects_the_glob_and_the_limit() {
+        let dir = temp_dir("policy-expand");
+        for rel in ["b.png", "a.png", "c.jpg", "sub/d.png", "sub/deep/e.png"] {
+            write_file(&dir, rel, b"x");
+        }
+        let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
+        let policy = store.load_enabled().unwrap();
+        let names = |pattern: &str, limit: usize| -> Result<Vec<String>, PolicyError> {
+            policy.expand_folder(&dir, pattern, limit).map(|l| {
+                l.files
+                    .iter()
+                    .map(|f| {
+                        f.strip_prefix(root_of(&dir))
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect()
+            })
+        };
+        assert_eq!(names("*.png", 10).unwrap(), ["a.png", "b.png"]);
+        assert_eq!(names("*.PNG", 10).unwrap(), ["a.png", "b.png"]);
+        assert_eq!(
+            names("**/*.png", 10).unwrap(),
+            ["a.png", "b.png", "sub/d.png", "sub/deep/e.png"]
+        );
+        assert!(names("**/*.png", 3)
+            .unwrap_err()
+            .to_string()
+            .contains("more than 3"));
+        assert!(names("*.gif", 10).unwrap().is_empty());
+        for d in [dir, pdir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Developer Mode or elevation to create symlinks"]
+    fn expanding_a_folder_leaves_out_symlinks_that_escape_it() {
+        let dir = temp_dir("policy-expand-link");
+        let outside_dir = temp_dir("policy-expand-link-out");
+        let target = write_file(&outside_dir, "secret.png", b"x");
+        write_file(&dir, "in/ok.png", b"x");
+        std::os::windows::fs::symlink_file(&target, dir.join("in/link.png"))
+            .expect("creating symlinks needs Developer Mode or elevation");
+        let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
+        let policy = store.load_enabled().unwrap();
+        let listing = policy.expand_folder(&dir.join("in"), "*.png", 10).unwrap();
+        assert_eq!(listing.files.len(), 1);
+        assert_eq!(listing.skipped.len(), 1);
+        for d in [dir, outside_dir, pdir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    /// Create a directory junction (`mklink /J`), which needs no privileges.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd.exe runs");
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_pointing_out_of_the_folder_is_neither_followed_nor_listed() {
+        let dir = temp_dir("policy-junction");
+        let outside_dir = temp_dir("policy-junction-out");
+        write_file(&outside_dir, "secret.png", b"x");
+        write_file(&outside_dir, "deep/secret2.png", b"x");
+        write_file(&dir, "in/ok.png", b"x");
+        let junction = dir.join("in/escape");
+        make_junction(&junction, &outside_dir);
+        // A junction to a folder inside the root is not followed either.
+        write_file(&dir, "in/real/inner.png", b"x");
+        let inner = dir.join("in/alias");
+        make_junction(&inner, &dir.join("in/real"));
+
+        let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
+        let policy = store.load_enabled().unwrap();
+        let listing = policy
+            .expand_folder(&dir.join("in"), "**/*.png", 10)
+            .unwrap();
+        let names: Vec<String> = listing
+            .files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains("secret")),
+            "followed a junction out of the folder: {names:?}"
+        );
+        assert!(names.iter().any(|n| n.ends_with("in/ok.png")), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.ends_with("in/real/inner.png")),
+            "{names:?}"
+        );
+        // The alias junction was not followed, so inner.png is listed once.
+        assert_eq!(
+            names.iter().filter(|n| n.ends_with("inner.png")).count(),
+            1,
+            "{names:?}"
+        );
+        assert!(
+            listing
+                .skipped
+                .iter()
+                .any(|(path, _)| path.ends_with("in/escape")),
+            "{:?}",
+            listing.skipped
+        );
+        // A file reached through the junction is refused by the path check too.
+        let through = junction.join("secret.png");
+        let root = format!("{}/in", root_of(&dir));
+        let (store2, pdir2, _) = signed_store(&policy_json(&root, ""));
+        assert!(store2.load_enabled().unwrap().check_path(&through).is_err());
+
+        // Remove the junctions themselves first, never what they point at.
+        fs::remove_dir(&junction).unwrap();
+        fs::remove_dir(&inner).unwrap();
+        assert!(outside_dir.join("secret.png").exists());
+        for d in [dir, outside_dir, pdir, pdir2] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expanding_a_folder_leaves_out_symlinks_that_escape_it() {
+        let dir = temp_dir("policy-expand-link");
+        let outside_dir = temp_dir("policy-expand-link-out");
+        let target = write_file(&outside_dir, "secret.png", b"x");
+        write_file(&dir, "in/ok.png", b"x");
+        std::os::unix::fs::symlink(&target, dir.join("in/link.png")).unwrap();
+        let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
+        let policy = store.load_enabled().unwrap();
+        let listing = policy.expand_folder(&dir.join("in"), "*.png", 10).unwrap();
+        assert_eq!(listing.files.len(), 1);
+        assert_eq!(listing.skipped.len(), 1);
+        for d in [dir, outside_dir, pdir] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 }
