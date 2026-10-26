@@ -124,19 +124,29 @@ impl std::error::Error for BatchPlanFailure {}
 pub struct ApprovedBatch {
     pub batch_id: String,
     pub creator: ResolvedCreator,
-    pub rate_limit_per_minute: u32,
     pub items: Vec<BatchItem>,
     pub aggregate_sha256: String,
     pub kind_counts: String,
     _guard: UploadGuard,
 }
 
-/// SHA-256 over the sorted lines `{canonical path}\0{file sha256}\n`.
-pub(crate) fn aggregate_sha256<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    let mut lines: Vec<String> = items
-        .into_iter()
-        .map(|(path, sha)| format!("{path}\0{sha}\n"))
-        .collect();
+/// The line one item contributes to the aggregate hash:
+/// `{canonical path}\0{sha256}\0{kind}\0{displayName}\0{sha256(description)}\n`.
+fn aggregate_line(item: &BatchItem) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\n",
+        item.path.display(),
+        item.sha256,
+        item.kind.api_name(),
+        item.display_name,
+        sha256_hex(item.description.as_bytes())
+    )
+}
+
+/// SHA-256 over the sorted item lines (see [`aggregate_line`]). Changing a
+/// file, its type, its display name or its description changes it.
+pub(crate) fn aggregate_sha256<'a>(items: impl IntoIterator<Item = &'a BatchItem>) -> String {
+    let mut lines: Vec<String> = items.into_iter().map(aggregate_line).collect();
     lines.sort();
     let mut hasher = Sha256::new();
     for line in &lines {
@@ -146,13 +156,7 @@ pub(crate) fn aggregate_sha256<'a>(items: impl IntoIterator<Item = (&'a str, &'a
 }
 
 fn items_aggregate(items: &[BatchItem]) -> String {
-    let paths: Vec<String> = items.iter().map(|i| i.path.display().to_string()).collect();
-    aggregate_sha256(
-        paths
-            .iter()
-            .map(String::as_str)
-            .zip(items.iter().map(|i| i.sha256.as_str())),
-    )
+    aggregate_sha256(items)
 }
 
 /// `3 Model, 2 Image`: most files first, ties in alphabetical type order.
@@ -389,7 +393,7 @@ impl UploadFlow {
             creator.creator.label(),
             &aggregate[..8]
         );
-        let batch_plan_id = uuid::Uuid::new_v4().to_string();
+        let batch_plan_id = format!("batch:{}", uuid::Uuid::new_v4());
 
         self.audit
             .append(AuditEntry {
@@ -433,7 +437,12 @@ impl UploadFlow {
         {
             let mut plans = self.batch_plans.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            plans.retain(|_, p| p.expires_at > now);
+            // A newer plan for any of the same files replaces the older one, so
+            // only the latest phrase for a file can be confirmed.
+            let planned: HashSet<&PathBuf> = items.iter().map(|i| &i.path).collect();
+            plans.retain(|_, p| {
+                p.expires_at > now && !p.items.iter().any(|i| planned.contains(&i.path))
+            });
             plans.insert(
                 batch_plan_id.clone(),
                 BatchPlan {
@@ -502,7 +511,8 @@ impl UploadFlow {
             .ok_or_else(|| {
                 eyre!(
                     "unknown or already used batch plan; call plan_upload_batch again (plans are \
-                     single use and expire after {} seconds)",
+                     single use, expire after {} seconds, and a newer plan for the same files \
+                     replaces an older one)",
                     self.ttl.as_secs()
                 )
             })?;
@@ -557,7 +567,6 @@ impl UploadFlow {
         Ok(ApprovedBatch {
             batch_id: plan_id.to_string(),
             creator: plan.creator,
-            rate_limit_per_minute: policy.rate_limit_per_minute,
             items: plan.items,
             aggregate_sha256: plan.aggregate_sha,
             kind_counts: plan.kind_counts,
@@ -565,34 +574,88 @@ impl UploadFlow {
         })
     }
 
+    /// Reload the signed policy for a running batch. An error here is about
+    /// the batch as a whole (policy disabled, invalid or unsigned, or the
+    /// creator no longer permitted), not about one file. Returns the rate
+    /// limit now in force.
+    pub fn batch_policy_limit(&self, creator: &ResolvedCreator) -> Result<u32, String> {
+        let policy = self.policy.load_enabled().map_err(|e| e.to_string())?;
+        if !policy.permits_creator(&creator.creator) {
+            return Err("the policy no longer permits this creator".to_string());
+        }
+        Ok(policy.rate_limit_per_minute)
+    }
+
     /// Re-read and re-verify one file of an approved batch right before it is
     /// sent, and build the [`ApprovedUpload`] the Open Cloud client needs.
-    /// Reloads the signed policy, so a policy turned off mid-batch stops it.
-    pub fn load_batch_item(&self, batch: &ApprovedBatch, index: usize) -> Result<ApprovedUpload> {
+    #[cfg(test)]
+    pub fn load_batch_item(
+        &self,
+        batch: &ApprovedBatch,
+        index: usize,
+    ) -> Result<ApprovedUpload, PrepareError> {
         let item = batch
             .items
             .get(index)
-            .ok_or_else(|| eyre!("no such batch item"))?;
-        let policy = self.policy.load_enabled()?;
-        if !policy.permits_creator(&batch.creator.creator) {
-            return Err(eyre!("the policy no longer permits this creator"));
+            .ok_or_else(|| PrepareError::Item("no such batch item".to_string()))?;
+        self.load_item(&batch.batch_id, &batch.creator, item)
+    }
+
+    /// [`load_batch_item`] on owned parts, so it can run in `spawn_blocking`.
+    /// Policy-level problems are [`PrepareError::Fatal`] and end the batch;
+    /// problems with this file are [`PrepareError::Item`].
+    pub fn load_item(
+        &self,
+        batch_id: &str,
+        creator: &ResolvedCreator,
+        item: &BatchItem,
+    ) -> Result<ApprovedUpload, PrepareError> {
+        let policy = self
+            .policy
+            .load_enabled()
+            .map_err(|e| PrepareError::Fatal(e.to_string()))?;
+        if !policy.permits_creator(&creator.creator) {
+            return Err(PrepareError::Fatal(
+                "the policy no longer permits this creator".to_string(),
+            ));
         }
-        let bytes = verify_item(&policy, item).map_err(|e| eyre!("{e}"))?;
-        let validated = asset_types::validate_upload(item.kind, &item.file_name, &bytes)?;
+        let bytes = verify_item(&policy, item).map_err(PrepareError::Item)?;
+        let validated = asset_types::validate_upload(item.kind, &item.file_name, &bytes)
+            .map_err(|e| PrepareError::Item(e.to_string()))?;
         Ok(ApprovedUpload {
-            plan_id: batch.batch_id.clone(),
+            plan_id: batch_id.to_string(),
             path: item.path.clone(),
             kind: item.kind,
             validated,
             bytes,
             sha256: item.sha256.clone(),
-            creator: batch.creator.clone(),
+            creator: creator.clone(),
             display_name: item.display_name.clone(),
             description: item.description.clone(),
             _guard: None,
         })
     }
 }
+
+/// Why a file could not be prepared for sending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareError {
+    /// The policy or creator problem applies to the whole batch: it ends,
+    /// whatever `onError` says.
+    Fatal(String),
+    /// Only this file is a problem (changed, unreadable, over a limit).
+    Item(String),
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrepareError::Fatal(m) | PrepareError::Item(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PrepareError {}
 
 /// Path, type, size, re-read and SHA checks for one planned file. Returns the
 /// bytes it read.
@@ -774,15 +837,169 @@ mod tests {
     }
 
     #[test]
-    fn the_aggregate_hash_covers_sorted_path_and_hash_lines() {
-        let a = aggregate_sha256([("/x/a", "11"), ("/x/b", "22")]);
-        let b = aggregate_sha256([("/x/b", "22"), ("/x/a", "11")]);
-        assert_eq!(a, b, "input order does not matter");
-        assert_ne!(a, aggregate_sha256([("/x/a", "11"), ("/x/b", "23")]));
-        assert_ne!(a, aggregate_sha256([("/x/a", "11"), ("/x/c", "22")]));
+    fn the_aggregate_hash_covers_sorted_path_hash_kind_name_and_description() {
+        fn item(path: &str, sha: &str) -> BatchItem {
+            BatchItem {
+                path: PathBuf::from(path),
+                file_name: "f".into(),
+                kind: AssetKind::Image,
+                bytes: 1,
+                sha256: sha.into(),
+                display_name: "name".into(),
+                description: "desc".into(),
+            }
+        }
+        let (a1, b1) = (item("/x/a", "11"), item("/x/b", "22"));
+        let base = aggregate_sha256([&a1, &b1]);
+        assert_eq!(
+            base,
+            aggregate_sha256([&b1, &a1]),
+            "input order does not matter"
+        );
+
+        let mut changed = b1.clone();
+        changed.sha256 = "23".into();
+        assert_ne!(base, aggregate_sha256([&a1, &changed]));
+        let mut changed = b1.clone();
+        changed.path = PathBuf::from("/x/c");
+        assert_ne!(base, aggregate_sha256([&a1, &changed]));
+        let mut changed = b1.clone();
+        changed.kind = AssetKind::Decal;
+        assert_ne!(base, aggregate_sha256([&a1, &changed]));
+        let mut changed = b1.clone();
+        changed.display_name = "other".into();
+        assert_ne!(base, aggregate_sha256([&a1, &changed]));
+        let mut changed = b1.clone();
+        changed.description = "other".into();
+        assert_ne!(base, aggregate_sha256([&a1, &changed]));
+
+        let line = |path: &str, sha: &str| {
+            format!(
+                "{path}\0{sha}\0Image\0name\0{}\n",
+                hex::encode(Sha256::digest(b"desc"))
+            )
+        };
         let mut h = Sha256::new();
-        h.update(b"/x/a\x0011\n/x/b\x0022\n");
-        assert_eq!(a, hex::encode(h.finalize()));
+        h.update(line("/x/a", "11").as_bytes());
+        h.update(line("/x/b", "22").as_bytes());
+        assert_eq!(base, hex::encode(h.finalize()));
+    }
+
+    #[test]
+    fn the_phrase_binds_the_display_name_description_and_type() {
+        let f = fixture("");
+        let plan_for = |mutate: &dyn Fn(&mut BatchItemRequest)| {
+            let mut item = f.item("a.png", "Image");
+            mutate(&mut item);
+            f.flow
+                .plan_batch(f.request(vec![item]))
+                .unwrap()
+                .confirm_phrase
+        };
+        let base = plan_for(&|_| {});
+        assert_ne!(base, plan_for(&|i| i.display_name = Some("Renamed".into())));
+        assert_ne!(base, plan_for(&|i| i.description = Some("new text".into())));
+        assert_ne!(base, plan_for(&|i| i.asset_type = "Decal".into()));
+        assert_eq!(base, plan_for(&|_| {}));
+    }
+
+    #[test]
+    fn a_newer_plan_for_the_same_files_replaces_the_older_one() {
+        let f = fixture("");
+        let a = f.item("a.png", "Image");
+        let b = f.item("b.png", "Image");
+        let c = f.item("c.png", "Image");
+        let old = f.flow.plan_batch(f.request(vec![a.clone()])).unwrap();
+        let unrelated = f.flow.plan_batch(f.request(vec![c])).unwrap();
+        let new = f.flow.plan_batch(f.request(vec![a, b])).unwrap();
+        let err = f
+            .flow
+            .approve_batch(&old.batch_plan_id, true, &old.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or already used"), "{err}");
+        // A plan for different files is untouched, and so is the newest one.
+        assert!(f
+            .flow
+            .approve_batch(&unrelated.batch_plan_id, true, &unrelated.confirm_phrase)
+            .is_ok());
+        assert!(f
+            .flow
+            .approve_batch(&new.batch_plan_id, true, &new.confirm_phrase)
+            .is_ok());
+    }
+
+    #[test]
+    fn batch_ids_are_prefixed_in_the_plan_and_the_audit_log() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        assert!(plan.batch_plan_id.starts_with("batch:"));
+        let (records, _) = f.flow.audit().tail(10).unwrap();
+        assert_eq!(
+            records[0].entry.plan_id.as_deref(),
+            Some(plan.batch_plan_id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_phrase_from_another_plan_is_rejected_and_burns_only_the_plan_it_was_sent_with() {
+        let f = fixture("");
+        let a = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        let b = f
+            .flow
+            .plan_batch(f.request(vec![f.item("b.png", "Image")]))
+            .unwrap();
+        assert_ne!(a.confirm_phrase, b.confirm_phrase);
+        let err = f
+            .flow
+            .approve_batch(&b.batch_plan_id, true, &a.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("confirmPhrase"), "{err}");
+        // B is gone ...
+        let err = f
+            .flow
+            .approve_batch(&b.batch_plan_id, true, &b.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or already used"), "{err}");
+        // ... A was not touched.
+        assert!(f
+            .flow
+            .approve_batch(&a.batch_plan_id, true, &a.confirm_phrase)
+            .is_ok());
+        assert!(f.events().contains(&"batch_denied".to_string()));
+    }
+
+    #[test]
+    fn the_folder_form_respects_deny_globs_and_the_built_in_rules() {
+        let f = fixture(r#", "deny_globs": ["**/*secret*"]"#);
+        f.write("ok.png", "Image");
+        f.write("secret-key.png", "Image");
+        f.write("reference-images/ref.png", "Image");
+        let req = BatchPlanRequest {
+            folder: Some(f.exports.to_string_lossy().into_owned()),
+            glob: Some("**/*.png".into()),
+            asset_type: Some("Image".into()),
+            creator: Some("personal".into()),
+            ..Default::default()
+        };
+        let failure = f.flow.plan_batch(req.clone()).unwrap_err();
+        assert_eq!(failure.refused.len(), 2, "{failure}");
+        assert!(failure
+            .refused
+            .iter()
+            .all(|r| r.reason.contains("deny rule")));
+
+        let mut skip = req;
+        skip.skip_refused = true;
+        let plan = f.flow.plan_batch(skip).unwrap();
+        assert_eq!(plan.total_files, 1);
+        assert_eq!(plan.items[0].display_name, "ok");
+        assert_eq!(plan.refused.len(), 2);
     }
 
     #[test]
@@ -945,7 +1162,7 @@ mod tests {
             .unwrap();
         assert_eq!(approved.items.len(), 2);
         assert_eq!(approved.batch_id, plan.batch_plan_id);
-        assert_eq!(approved.rate_limit_per_minute, 10);
+        assert_eq!(f.flow.batch_policy_limit(&approved.creator), Ok(10));
         assert_eq!(f.events(), ["batch_planned", "batch_approved"]);
         assert!(f.flow.audit().verify().ok);
         let one = f.flow.load_batch_item(&approved, 1).unwrap();

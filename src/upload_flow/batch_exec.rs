@@ -5,19 +5,21 @@
 //! sits behind [`BatchBackend`], so tests drive it with a fake and never
 //! reach a network.
 //!
-//! For each file, in sorted order: wait for a rate-limit slot (sleeping until
-//! the sliding window has room), re-verify the file, start the upload, record
-//! `upload_started`, wait for the operation, record `upload_finished` or
-//! `upload_failed`. Files that were never attempted are reported
-//! `not_started`.
+//! For each file, in sorted order: reload the signed policy (a policy or
+//! creator problem ends the whole batch), wait for a rate-limit slot
+//! (sleeping until the sliding window has room), re-verify the file, write
+//! `upload_sending` to the audit log (if that fails the file is not sent), start
+//! the upload, record `upload_started`, wait for the operation, record
+//! `upload_finished` or `upload_failed`. Files that were never attempted are
+//! reported `not_started`.
 //!
-//! `maxWait` bounds the time spent waiting for the rate limit and the time at
-//! which a new file may start: a file is not started if its slot would only
-//! open after the budget is used up. An upload that is already running is
-//! polled to completion (the client's own 60 second poll limit), so the total
-//! can exceed the budget by at most that.
+//! `maxWait` bounds only the time spent **sleeping for the rate limit**: a file
+//! is not started if its slot would only open after the sleeping budget is used
+//! up. Time spent uploading and polling does not count against it. A cancelled
+//! request (`is_cancelled`) stops the batch between files and interrupts the
+//! rate-limit sleep; the upload in flight finishes first.
 
-use super::batch::BatchItem;
+use super::batch::{BatchItem, PrepareError};
 use super::*;
 use std::future::Future;
 
@@ -96,6 +98,8 @@ pub struct BatchResult {
     pub failed: usize,
     pub not_started: usize,
     pub elapsed_seconds: f64,
+    /// Time spent sleeping for the rate limit (what maxWaitSeconds caps).
+    pub waited_seconds: f64,
     /// Why files were left `not_started`, if any were.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_because: Option<String>,
@@ -106,10 +110,17 @@ pub struct BatchResult {
 
 /// Everything the executor needs from the outside world.
 pub trait BatchBackend: Sync {
-    /// Take a rate-limit slot, or say how long until one is free.
-    fn try_slot(&self) -> Result<(), Duration>;
+    /// Reload the signed policy. `Err` is a problem for the whole batch and
+    /// ends it; `Ok` is the rate limit now in force.
+    fn policy_check(&self) -> Result<u32, String>;
+    /// Take a rate-limit slot (`limit` per minute), or say how long until one
+    /// is free.
+    fn try_slot(&self, limit: u32) -> Result<(), Duration>;
     /// Re-read and re-verify item `index` right before it is sent.
-    fn prepare(&self, index: usize) -> impl Future<Output = Result<ApprovedUpload>> + Send;
+    fn prepare(
+        &self,
+        index: usize,
+    ) -> impl Future<Output = Result<ApprovedUpload, PrepareError>> + Send;
     /// Send the create request; returns the operation path.
     fn start(&self, approved: &ApprovedUpload) -> impl Future<Output = Result<String>> + Send;
     /// Wait for the operation; returns the final response.
@@ -118,6 +129,10 @@ pub trait BatchBackend: Sync {
     /// Time since the batch started.
     fn elapsed(&self) -> Duration;
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+    /// Has the client cancelled the request?
+    fn is_cancelled(&self) -> bool;
+    /// Completes when the request is cancelled.
+    fn cancelled(&self) -> impl Future<Output = ()> + Send;
 }
 
 fn entry(event: &str, batch: &super::ApprovedBatch, item: &BatchItem) -> AuditEntry {
@@ -144,6 +159,7 @@ pub async fn run_batch<B: BatchBackend>(
     let mut items: Vec<ItemResult> = Vec::with_capacity(batch.items.len());
     let mut halt: Option<String> = None;
     let mut warnings: Vec<String> = Vec::new();
+    let mut waited = Duration::ZERO;
 
     // Records an audit step; a failure stops the rest of the batch.
     let note = |result: Result<()>, halt: &mut Option<String>, warnings: &mut Vec<String>| {
@@ -163,31 +179,41 @@ pub async fn run_batch<B: BatchBackend>(
             r.error = Some(reason.to_string());
             r
         };
+        if halt.is_none() && backend.is_cancelled() {
+            halt = Some(CANCELLED.to_string());
+        }
         if let Some(reason) = &halt {
             items.push(not_started(reason));
             continue;
         }
 
-        // Wait for a rate-limit slot, within the budget.
+        // A policy or creator problem ends the batch before a slot is taken.
+        let limit = match backend.policy_check() {
+            Ok(limit) => limit,
+            Err(why) => {
+                halt = Some(format!("the batch stopped: {why}"));
+                items.push(not_started(halt.as_deref().unwrap_or_default()));
+                continue;
+            }
+        };
+
+        // Wait for a rate-limit slot, within the sleeping budget.
         let mut got_slot = false;
         while !got_slot && halt.is_none() {
-            if backend.elapsed() >= max_wait {
-                halt = Some(format!(
-                    "the maxWaitSeconds budget ({}s) is used up",
-                    max_wait.as_secs()
-                ));
-                break;
-            }
-            match backend.try_slot() {
+            match backend.try_slot(limit) {
                 Ok(()) => got_slot = true,
                 Err(wait) => {
-                    if backend.elapsed() + wait > max_wait {
+                    if waited + wait > max_wait {
                         halt = Some(format!(
-                            "waiting for the rate limit would exceed maxWaitSeconds ({}s)",
+                            "waiting for the rate limit would exceed maxWaitSeconds ({}s of waiting)",
                             max_wait.as_secs()
                         ));
                     } else {
-                        backend.sleep(wait).await;
+                        tokio::select! {
+                            biased;
+                            () = backend.cancelled() => halt = Some(CANCELLED.to_string()),
+                            () = backend.sleep(wait) => waited += wait,
+                        }
                     }
                 }
             }
@@ -198,11 +224,28 @@ pub async fn run_batch<B: BatchBackend>(
         }
 
         let mut result = ItemResult::new(&file, ItemStatus::Failed);
+        let mut fatal: Option<String> = None;
         let outcome: Result<(), String> = async {
-            let approved = backend
-                .prepare(index)
-                .await
-                .map_err(|e| format!("not sent: {e}"))?;
+            let approved = match backend.prepare(index).await {
+                Ok(approved) => approved,
+                Err(PrepareError::Fatal(why)) => {
+                    fatal = Some(why);
+                    return Ok(());
+                }
+                Err(PrepareError::Item(why)) => return Err(format!("not sent: {why}")),
+            };
+            // Written before the request leaves, so a crash mid-send still
+            // leaves a record of which file was going out. Fail closed.
+            let mut sending = entry("upload_sending", batch, item);
+            sending.detail = Some(format!(
+                "displayName={}; descriptionSha256={}",
+                item.display_name,
+                sha256_hex(item.description.as_bytes())
+            ));
+            if let Err(e) = backend.record(sending) {
+                note(Err(e), &mut halt, &mut warnings);
+                return Err("not sent: the audit log could not be written".to_string());
+            }
             let operation = backend.start(&approved).await.map_err(|e| e.to_string())?;
             // The asset may exist from here on, so record the operation before polling.
             result.operation = Some(operation.clone());
@@ -220,6 +263,11 @@ pub async fn run_batch<B: BatchBackend>(
         }
         .await;
 
+        if let Some(why) = fatal {
+            halt = Some(format!("the batch stopped: {why}"));
+            items.push(not_started(halt.as_deref().unwrap_or_default()));
+            continue;
+        }
         match outcome {
             Ok(()) => {
                 result.status = ItemStatus::Uploaded;
@@ -270,9 +318,13 @@ pub async fn run_batch<B: BatchBackend>(
             .to_string(),
         ),
         detail: Some(format!(
-            "uploaded={uploaded} failed={failed} not_started={not_started} elapsed={}s onError={}",
+            "uploaded={uploaded} failed={failed} not_started={not_started} elapsed={}s waited={}s onError={}{}",
             elapsed.as_secs(),
-            on_error.label()
+            waited.as_secs(),
+            on_error.label(),
+            halt.as_deref()
+                .map(|h| format!(" stopped=\"{h}\""))
+                .unwrap_or_default()
         )),
         ..Default::default()
     };
@@ -288,10 +340,13 @@ pub async fn run_batch<B: BatchBackend>(
         failed,
         not_started,
         elapsed_seconds: (elapsed.as_secs_f64() * 10.0).round() / 10.0,
+        waited_seconds: (waited.as_secs_f64() * 10.0).round() / 10.0,
         stopped_because: halt,
         audit_warnings: warnings,
     }
 }
+
+const CANCELLED: &str = "cancelled: the client cancelled the request";
 
 #[cfg(test)]
 mod tests {
@@ -300,6 +355,7 @@ mod tests {
     use super::*;
     use std::collections::{HashSet, VecDeque};
     use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     /// A backend with a virtual clock and a virtual rate-limit window: no
@@ -310,14 +366,26 @@ mod tests {
         limit: usize,
         clock: Mutex<Duration>,
         window: Mutex<VecDeque<Duration>>,
+        /// Virtual time every upload takes (the clock moves during `start`).
+        upload_time: Duration,
         /// Display names whose create request fails.
         fail_start: HashSet<&'static str>,
         /// Display names whose operation fails while polling.
         fail_finish: HashSet<&'static str>,
         /// Audit events that fail to be written.
         fail_record: HashSet<&'static str>,
+        /// Polling never completes (for dropping the future mid-upload).
+        hang_finish: bool,
+        /// The client cancels once this many files were sent.
+        cancel_after_sent: Option<usize>,
+        /// The client cancels while the batch is sleeping for the rate limit.
+        cancel_on_sleep: bool,
+        /// Someone turns the policy off once this many files were sent.
+        disable_policy_after_sent: Option<usize>,
+        cancelled: AtomicBool,
         sent: Mutex<Vec<String>>,
         sleeps: Mutex<Vec<Duration>>,
+        limits_seen: Mutex<Vec<u32>>,
     }
 
     impl<'a> Fake<'a> {
@@ -328,17 +396,29 @@ mod tests {
                 limit,
                 clock: Mutex::new(Duration::ZERO),
                 window: Mutex::new(VecDeque::new()),
+                upload_time: Duration::ZERO,
                 fail_start: HashSet::new(),
                 fail_finish: HashSet::new(),
                 fail_record: HashSet::new(),
+                hang_finish: false,
+                cancel_after_sent: None,
+                cancel_on_sleep: false,
+                disable_policy_after_sent: None,
+                cancelled: AtomicBool::new(false),
                 sent: Mutex::new(Vec::new()),
                 sleeps: Mutex::new(Vec::new()),
+                limits_seen: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl BatchBackend for Fake<'_> {
-        fn try_slot(&self) -> Result<(), Duration> {
+        fn policy_check(&self) -> Result<u32, String> {
+            self.flow.batch_policy_limit(&self.batch.creator)
+        }
+
+        fn try_slot(&self, limit: u32) -> Result<(), Duration> {
+            self.limits_seen.lock().unwrap().push(limit);
             let now = *self.clock.lock().unwrap();
             let mut w = self.window.lock().unwrap();
             while w.front().is_some_and(|t| now - *t >= RATE_WINDOW) {
@@ -351,7 +431,7 @@ mod tests {
             Ok(())
         }
 
-        async fn prepare(&self, index: usize) -> Result<ApprovedUpload> {
+        async fn prepare(&self, index: usize) -> Result<ApprovedUpload, PrepareError> {
             self.flow.load_batch_item(self.batch, index)
         }
 
@@ -359,14 +439,26 @@ mod tests {
             if self.fail_start.contains(approved.display_name.as_str()) {
                 return Err(eyre!("Asset upload failed (400): bad request"));
             }
-            self.sent
-                .lock()
-                .unwrap()
-                .push(approved.display_name.clone());
+            let sent = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(approved.display_name.clone());
+                sent.len()
+            };
+            *self.clock.lock().unwrap() += self.upload_time;
+            if self.cancel_after_sent == Some(sent) {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            if self.disable_policy_after_sent == Some(sent) {
+                fs::write(self.flow.policy.policy_path(), r#"{ "enabled": false }"#).unwrap();
+                self.flow.policy.sign().unwrap();
+            }
             Ok(format!("operations/{}", approved.display_name))
         }
 
         async fn finish(&self, operation: &str) -> Result<serde_json::Value> {
+            if self.hang_finish {
+                std::future::pending::<()>().await;
+            }
             let name = operation.trim_start_matches("operations/");
             if self.fail_finish.contains(name) {
                 return Err(eyre!("Operation failed: moderation"));
@@ -389,8 +481,22 @@ mod tests {
         }
 
         async fn sleep(&self, d: Duration) {
+            if self.cancel_on_sleep {
+                self.cancelled.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
             self.sleeps.lock().unwrap().push(d);
             *self.clock.lock().unwrap() += d;
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        async fn cancelled(&self) {
+            while !self.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -426,10 +532,13 @@ mod tests {
             [
                 "batch_planned",
                 "batch_approved",
+                "upload_sending",
                 "upload_started",
                 "upload_finished",
+                "upload_sending",
                 "upload_started",
                 "upload_finished",
+                "upload_sending",
                 "upload_started",
                 "upload_finished",
                 "batch_finished",
@@ -637,6 +746,233 @@ mod tests {
         assert!(f
             .flow
             .approve_batch(&other.batch_plan_id, true, &other.confirm_phrase)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn each_file_is_recorded_before_it_is_sent_and_a_failed_write_blocks_the_send() {
+        let f = fixture("");
+        let batch = batch_of(&f, 2);
+        let fake = Fake::new(&f.flow, &batch, 10);
+        let r = run_batch(&fake, &batch, OnError::Continue, Duration::from_secs(600)).await;
+        assert_eq!(r.uploaded, 2);
+        let (records, _) = f.flow.audit().tail(100).unwrap();
+        let sending: Vec<_> = records
+            .iter()
+            .filter(|rec| rec.entry.event == "upload_sending")
+            .collect();
+        assert_eq!(sending.len(), 2);
+        let first = &sending[0].entry;
+        assert!(first.path.as_deref().unwrap().ends_with("a.png"));
+        assert_eq!(
+            first.sha256.as_deref(),
+            Some(batch.items[0].sha256.as_str())
+        );
+        assert_eq!(first.asset_type.as_deref(), Some("Image"));
+        assert!(first.detail.as_deref().unwrap().contains("displayName=a"));
+        // upload_sending comes right before the request goes out.
+        let pos = |ev: &str| records.iter().position(|r| r.entry.event == ev).unwrap();
+        assert!(pos("upload_sending") < pos("upload_started"));
+
+        let f = fixture("");
+        let batch = batch_of(&f, 3);
+        let mut fake = Fake::new(&f.flow, &batch, 10);
+        fake.fail_record.insert("upload_sending");
+        let r = run_batch(&fake, &batch, OnError::Continue, Duration::from_secs(600)).await;
+        assert!(fake.sent.lock().unwrap().is_empty(), "nothing may be sent");
+        assert_eq!(r.items[0].status, ItemStatus::Failed);
+        assert!(r.items[0].error.as_deref().unwrap().contains("audit log"));
+        assert_eq!(r.items[1].status, ItemStatus::NotStarted);
+        assert!(!r.audit_warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_between_files_stops_the_batch_and_releases_the_lock() {
+        let f = fixture("");
+        let batch = batch_of(&f, 3);
+        let mut fake = Fake::new(&f.flow, &batch, 10);
+        fake.cancel_after_sent = Some(1);
+        let r = run_batch(&fake, &batch, OnError::Continue, Duration::from_secs(600)).await;
+        assert_eq!(
+            statuses(&r),
+            [
+                ItemStatus::Uploaded,
+                ItemStatus::NotStarted,
+                ItemStatus::NotStarted
+            ]
+        );
+        assert!(r.stopped_because.as_deref().unwrap().contains("cancelled"));
+        assert!(r.items[1].error.as_deref().unwrap().contains("cancelled"));
+        assert_eq!(*fake.sent.lock().unwrap(), ["a"]);
+        // batch_finished is still written and says why.
+        let (records, chain) = f.flow.audit().tail(100).unwrap();
+        assert!(chain.ok);
+        let last = &records.last().unwrap().entry;
+        assert_eq!(last.event, "batch_finished");
+        assert!(last.detail.as_deref().unwrap().contains("cancelled"));
+        // The lock is released once the approved batch is gone.
+        drop(fake);
+        drop(batch);
+        let next = f
+            .flow
+            .plan_batch(f.request(vec![f.item("z.png", "Image")]))
+            .unwrap();
+        assert!(f
+            .flow
+            .approve_batch(&next.batch_plan_id, true, &next.confirm_phrase)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_the_rate_limit_sleep_stops_the_batch_at_once() {
+        let f = fixture("");
+        let batch = batch_of(&f, 3);
+        let mut fake = Fake::new(&f.flow, &batch, 1);
+        fake.cancel_on_sleep = true;
+        let r = run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(600)).await;
+        assert_eq!((r.uploaded, r.failed, r.not_started), (1, 0, 2));
+        assert!(r.stopped_because.as_deref().unwrap().contains("cancelled"));
+        // The sleep was interrupted, not completed.
+        assert!(fake.sleeps.lock().unwrap().is_empty());
+        assert_eq!(r.waited_seconds, 0.0);
+        assert_eq!(
+            f.events().last().map(String::as_str),
+            Some("batch_finished")
+        );
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_requests_start_nothing() {
+        let f = fixture("");
+        let batch = batch_of(&f, 2);
+        let fake = Fake::new(&f.flow, &batch, 10);
+        fake.cancelled.store(true, Ordering::SeqCst);
+        let r = run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(600)).await;
+        assert_eq!((r.uploaded, r.failed, r.not_started), (0, 0, 2));
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_policy_problem_mid_batch_ends_it_even_with_on_error_continue() {
+        let f = fixture("");
+        let batch = batch_of(&f, 4);
+        let mut fake = Fake::new(&f.flow, &batch, 1);
+        fake.disable_policy_after_sent = Some(1);
+        let r = run_batch(&fake, &batch, OnError::Continue, Duration::from_secs(600)).await;
+        assert_eq!(
+            statuses(&r),
+            [
+                ItemStatus::Uploaded,
+                ItemStatus::NotStarted,
+                ItemStatus::NotStarted,
+                ItemStatus::NotStarted
+            ]
+        );
+        assert_eq!(r.failed, 0, "no file is blamed for a policy change");
+        assert!(r.stopped_because.as_deref().unwrap().contains("disabled"));
+        // No further slot was taken or waited for (the limit is 1 per minute).
+        assert_eq!(fake.window.lock().unwrap().len(), 1);
+        assert!(fake.sleeps.lock().unwrap().is_empty());
+        assert_eq!(fake.limits_seen.lock().unwrap().len(), 1);
+        assert!(f.flow.audit().verify().ok);
+    }
+
+    #[tokio::test]
+    async fn a_creator_the_policy_no_longer_permits_ends_the_batch() {
+        let f = fixture("");
+        let batch = batch_of(&f, 2);
+        let fake = Fake::new(&f.flow, &batch, 10);
+        let json = format!(
+            r#"{{ "enabled": true, "allowed_roots": ["{}"], "allow_unlisted_creators": false,
+                 "creators": {{ "team": {{ "groupId": "222" }} }} }}"#,
+            f.root
+        );
+        fs::write(f.flow.policy.policy_path(), json).unwrap();
+        f.flow.policy.sign().unwrap();
+        let r = run_batch(&fake, &batch, OnError::Continue, Duration::from_secs(600)).await;
+        assert_eq!((r.uploaded, r.failed, r.not_started), (0, 0, 2));
+        assert!(r.stopped_because.as_deref().unwrap().contains("creator"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_comes_from_the_policy_reloaded_for_each_file() {
+        let f = fixture("");
+        let batch = batch_of(&f, 2);
+        let fake = Fake::new(&f.flow, &batch, 10);
+        let json = format!(
+            r#"{{ "enabled": true, "allowed_roots": ["{}"], "rate_limit_per_minute": 3,
+                 "creators": {{ "personal": {{ "userId": "111" }} }} }}"#,
+            f.root
+        );
+        fs::write(f.flow.policy.policy_path(), json).unwrap();
+        f.flow.policy.sign().unwrap();
+        run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(600)).await;
+        assert_eq!(*fake.limits_seen.lock().unwrap(), [3, 3]);
+    }
+
+    #[tokio::test]
+    async fn upload_time_does_not_count_against_max_wait() {
+        // Five uploads of 30 virtual seconds, no rate-limit waiting needed:
+        // a 10 second sleeping budget is enough.
+        let f = fixture("");
+        let batch = batch_of(&f, 5);
+        let mut fake = Fake::new(&f.flow, &batch, 10);
+        fake.upload_time = Duration::from_secs(30);
+        let r = run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(10)).await;
+        assert_eq!((r.uploaded, r.not_started), (5, 0));
+        assert_eq!(r.elapsed_seconds, 150.0);
+        assert_eq!(r.waited_seconds, 0.0);
+        assert!(r.stopped_because.is_none());
+
+        // With a limit of 1 per minute and 30 second uploads each file waits
+        // 30 more seconds: a 29 second budget is not enough, 30 is.
+        for (budget, expect_uploaded) in [(29, 1), (30, 2)] {
+            let f = fixture("");
+            let batch = batch_of(&f, 2);
+            let mut fake = Fake::new(&f.flow, &batch, 1);
+            fake.upload_time = Duration::from_secs(30);
+            let r = run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(budget)).await;
+            assert_eq!(r.uploaded, expect_uploaded, "budget {budget}");
+            if expect_uploaded == 2 {
+                assert_eq!(r.waited_seconds, 30.0);
+                assert_eq!(r.elapsed_seconds, 90.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_future_mid_upload_releases_the_lock_and_leaves_the_log_consistent() {
+        let f = fixture("");
+        let batch = batch_of(&f, 2);
+        {
+            let mut fake = Fake::new(&f.flow, &batch, 10);
+            fake.hang_finish = true;
+            let run = run_batch(&fake, &batch, OnError::Stop, Duration::from_secs(600));
+            let timed = tokio::time::timeout(Duration::from_millis(100), run).await;
+            assert!(timed.is_err(), "the upload was meant to hang");
+            assert_eq!(*fake.sent.lock().unwrap(), ["a"]);
+        }
+        // The file was recorded as going out and started; nothing claims more.
+        assert_eq!(
+            f.events(),
+            [
+                "batch_planned",
+                "batch_approved",
+                "upload_sending",
+                "upload_started"
+            ]
+        );
+        assert!(f.flow.audit().verify().ok);
+        // The lock goes with the approved batch.
+        drop(batch);
+        let next = f
+            .flow
+            .plan_batch(f.request(vec![f.item("z.png", "Image")]))
+            .unwrap();
+        assert!(f
+            .flow
+            .approve_batch(&next.batch_plan_id, true, &next.confirm_phrase)
             .is_ok());
     }
 

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 mod batch;
 mod batch_exec;
 
-pub use batch::{ApprovedBatch, BatchItemRequest, BatchPlanRequest};
+pub use batch::{ApprovedBatch, BatchItemRequest, BatchPlanRequest, PrepareError};
 pub use batch_exec::{run_batch, BatchBackend, OnError};
 
 /// How long a plan stays valid.

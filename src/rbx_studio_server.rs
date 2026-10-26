@@ -6,7 +6,7 @@ use crate::open_cloud::OpenCloudClient;
 use crate::secret_store::redact;
 use crate::upload_flow::{
     run_batch, ApprovedBatch, ApprovedUpload, BatchBackend, BatchItemRequest, BatchPlanRequest,
-    OnError, PlanRequest, UploadFlow,
+    OnError, PlanRequest, PrepareError, UploadFlow,
 };
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -27,6 +27,7 @@ use tokio::process::Command;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
@@ -490,27 +491,46 @@ struct UploadBatch {
     on_error: Option<String>,
     #[serde(rename = "maxWaitSeconds")]
     #[schemars(
-        description = "Longest time the batch may spend waiting for the upload rate limit before it gives up on the remaining files (reported not_started). Default 600, at most 3600."
+        description = "Longest total time the batch may spend sleeping for the upload rate limit before it gives up on the remaining files (reported not_started). Only that sleeping counts; time spent uploading and waiting for Roblox to process a file does not. Default 600, at most 3600."
     )]
     max_wait_seconds: Option<u64>,
 }
 
 /// Open Cloud side of a running batch; the executor drives it.
 struct CloudBatchBackend<'a> {
-    flow: &'a UploadFlow,
+    flow: Arc<UploadFlow>,
     client: OpenCloudClient,
     batch: &'a ApprovedBatch,
     started: std::time::Instant,
+    /// Cancelled when the client cancels the request or disconnects.
+    ct: CancellationToken,
 }
 
 impl BatchBackend for CloudBatchBackend<'_> {
-    fn try_slot(&self) -> Result<(), Duration> {
-        self.flow.take_upload_slot(self.batch.rate_limit_per_minute)
+    fn policy_check(&self) -> Result<u32, String> {
+        self.flow.batch_policy_limit(&self.batch.creator)
     }
 
-    async fn prepare(&self, index: usize) -> EyreResult<ApprovedUpload> {
-        // One file at a time: a read and a hash, short next to the upload.
-        self.flow.load_batch_item(self.batch, index)
+    fn try_slot(&self, limit: u32) -> Result<(), Duration> {
+        self.flow.take_upload_slot(limit)
+    }
+
+    async fn prepare(&self, index: usize) -> Result<ApprovedUpload, PrepareError> {
+        // Reads and hashes up to 20 MB: keep it off the async workers.
+        let item = self
+            .batch
+            .items
+            .get(index)
+            .cloned()
+            .ok_or_else(|| PrepareError::Item("no such batch item".to_string()))?;
+        let (flow, creator, id) = (
+            self.flow.clone(),
+            self.batch.creator.clone(),
+            self.batch.batch_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || flow.load_item(&id, &creator, &item))
+            .await
+            .map_err(|e| PrepareError::Item(format!("could not prepare the file: {e}")))?
     }
 
     async fn start(&self, approved: &ApprovedUpload) -> EyreResult<String> {
@@ -531,6 +551,14 @@ impl BatchBackend for CloudBatchBackend<'_> {
 
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.ct.is_cancelled()
+    }
+
+    async fn cancelled(&self) {
+        self.ct.cancelled().await;
     }
 }
 
@@ -1030,11 +1058,12 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Batch step 2 of uploading: send the files named by a plan from plan_upload_batch to Roblox, one at a time, only after the user agreed to that exact batch. Needs planId (the batchPlanId), confirm: true and the exact confirmPhrase. Plans are single use and expire after 10 minutes. Every file is re-checked against the signed policy and its planned hash before the first upload; one failure aborts the whole batch before anything is sent. Then the files upload sequentially and the call waits for the upload rate limit between files (this can take minutes; the plan shows an estimate). onError: stop (default) halts after the first failed file, continue goes on. maxWaitSeconds (default 600, max 3600) caps the time spent waiting for the rate limit; files not reached are reported not_started. Only one batch can run at a time. Returns a per-file status (uploaded, failed, not_started) with asset IDs, plus counts and elapsed time."
+        description = "Batch step 2 of uploading: send the files named by a plan from plan_upload_batch to Roblox, one at a time, only after the user agreed to that exact batch. Needs planId (the batchPlanId), confirm: true and the exact confirmPhrase. Plans are single use and expire after 10 minutes. Every file is re-checked against the signed policy and its planned hash before the first upload; one failure aborts the whole batch before anything is sent. Then the files upload sequentially and the call waits for the upload rate limit between files (this can take minutes; the plan shows an estimate). onError: stop (default) halts after the first failed file, continue goes on; a policy or creator problem ends the batch either way. maxWaitSeconds (default 600, max 3600) caps the total time spent sleeping for the rate limit (upload time does not count); files not reached are reported not_started. Cancelling the request stops the batch between files. Only one batch can run at a time. Returns a per-file status (uploaded, failed, not_started) with asset IDs, plus counts and elapsed time."
     )]
     async fn upload_batch(
         &self,
         Parameters(args): Parameters<UploadBatch>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let on_error = match OnError::parse(args.on_error.as_deref()) {
             Ok(v) => v,
@@ -1054,13 +1083,14 @@ impl RBXStudioServer {
         };
 
         let backend = CloudBatchBackend {
-            flow: &self.flow,
+            flow: self.flow.clone(),
             client: self.open_cloud(),
             batch: &approved,
             started: std::time::Instant::now(),
+            ct,
         };
         let result = run_batch(&backend, &approved, on_error, max_wait).await;
-        let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+        let text = redact(&serde_json::to_string_pretty(&result).unwrap_or_default());
         if result.failed == 0 && result.not_started == 0 {
             Ok(CallToolResult::success(vec![Content::text(text)]))
         } else {
@@ -1568,26 +1598,32 @@ mod tests {
     async fn upload_batch_without_a_plan_is_refused_before_any_network_call() {
         let s = server(ServerMode::Cloud);
         let result = s
-            .upload_batch(Parameters(UploadBatch {
-                plan_id: "made-up".to_string(),
-                confirm: true,
-                confirm_phrase: "UPLOAD BATCH anything".to_string(),
-                on_error: None,
-                max_wait_seconds: None,
-            }))
+            .upload_batch(
+                Parameters(UploadBatch {
+                    plan_id: "made-up".to_string(),
+                    confirm: true,
+                    confirm_phrase: "UPLOAD BATCH anything".to_string(),
+                    on_error: None,
+                    max_wait_seconds: None,
+                }),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let text = result_text(&result);
         assert!(text.contains("unknown or already used"), "{text}");
 
         let bad = s
-            .upload_batch(Parameters(UploadBatch {
-                plan_id: "x".to_string(),
-                confirm: true,
-                confirm_phrase: "x".to_string(),
-                on_error: Some("explode".to_string()),
-                max_wait_seconds: None,
-            }))
+            .upload_batch(
+                Parameters(UploadBatch {
+                    plan_id: "x".to_string(),
+                    confirm: true,
+                    confirm_phrase: "x".to_string(),
+                    on_error: Some("explode".to_string()),
+                    max_wait_seconds: None,
+                }),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(
