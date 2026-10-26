@@ -618,3 +618,613 @@ fn verify_item(policy: &Policy, item: &BatchItem) -> Result<Vec<u8>, String> {
     asset_types::validate_upload(item.kind, &item.file_name, &bytes).map_err(|e| e.to_string())?;
     Ok(bytes)
 }
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    use crate::policy::test_support::{signed_store, temp_dir};
+    use std::fs;
+
+    pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    pub const GLB: &[u8] = b"glTF\x02\0\0\0\0\0\0\0";
+
+    pub struct BatchFixture {
+        pub flow: UploadFlow,
+        pub exports: PathBuf,
+        pub root: String,
+        pub dirs: Vec<PathBuf>,
+    }
+
+    impl Drop for BatchFixture {
+        fn drop(&mut self) {
+            for d in &self.dirs {
+                let _ = fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    pub fn fixture(extra: &str) -> BatchFixture {
+        fixture_with_ttl(extra, PLAN_TTL)
+    }
+
+    pub fn fixture_with_ttl(extra: &str, ttl: Duration) -> BatchFixture {
+        let dir = temp_dir("batch");
+        let exports = dir.join("exports");
+        fs::create_dir_all(&exports).unwrap();
+        let root = fs::canonicalize(&exports)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches("//?/")
+            .to_string();
+        let json = format!(
+            r#"{{ "enabled": true, "allowed_roots": ["{root}"],
+                 "creators": {{ "personal": {{ "userId": "111" }}, "team": {{ "groupId": "222" }} }} {extra} }}"#
+        );
+        let (store, policy_dir, secrets) = signed_store(&json);
+        let audit_path = dir.join("audit").join("uploads.jsonl");
+        let audit = Arc::new(AuditLog::new(audit_path, secrets));
+        BatchFixture {
+            flow: UploadFlow::new(store, audit).with_ttl(ttl),
+            exports,
+            root,
+            dirs: vec![dir, policy_dir],
+        }
+    }
+
+    impl BatchFixture {
+        /// Write `name` under exports; content is unique per name.
+        pub fn write(&self, name: &str, kind: &str) -> PathBuf {
+            let path = self.exports.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let head = if kind == "Model" { GLB } else { PNG };
+            fs::write(&path, [head, name.as_bytes()].concat()).unwrap();
+            path
+        }
+
+        pub fn item(&self, name: &str, kind: &str) -> BatchItemRequest {
+            let path = self.write(name, kind);
+            item_for(&path, kind)
+        }
+
+        pub fn request(&self, items: Vec<BatchItemRequest>) -> BatchPlanRequest {
+            BatchPlanRequest {
+                items: Some(items),
+                creator: Some("personal".into()),
+                ..Default::default()
+            }
+        }
+
+        pub fn events(&self) -> Vec<String> {
+            self.flow
+                .audit()
+                .tail(500)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|r| r.entry.event)
+                .collect()
+        }
+
+        /// Plan and approve in one go.
+        pub fn approved(&self, items: Vec<BatchItemRequest>) -> ApprovedBatch {
+            let plan = self.flow.plan_batch(self.request(items)).unwrap();
+            self.flow
+                .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+                .unwrap()
+        }
+    }
+
+    pub fn item_for(path: &Path, kind: &str) -> BatchItemRequest {
+        BatchItemRequest {
+            file_path: path.to_string_lossy().into_owned(),
+            asset_type: kind.to_string(),
+            display_name: None,
+            description: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use std::fs;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn plans_a_batch_of_n_files_with_the_documented_phrase() {
+        let f = fixture("");
+        let items = vec![
+            f.item("a.png", "Image"),
+            f.item("b.glb", "Model"),
+            f.item("c.png", "Image"),
+            f.item("d.glb", "Model"),
+            f.item("e.png", "Image"),
+        ];
+        let plan = f.flow.plan_batch(f.request(items)).unwrap();
+        assert_eq!(plan.total_files, 5);
+        assert_eq!(plan.kind_counts, "3 Image, 2 Model");
+        assert_eq!(plan.creator, "personal (user 111)");
+        assert_eq!(
+            plan.confirm_phrase,
+            format!(
+                "UPLOAD BATCH 5 files (3 Image, 2 Model) to user 111 sha:{}",
+                &plan.aggregate_sha256[..8]
+            )
+        );
+        assert!(plan.refused.is_empty());
+        let names: Vec<&str> = plan.items.iter().map(|i| i.display_name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+        let files: Vec<&str> = plan.items.iter().map(|i| i.file.as_str()).collect();
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted);
+        assert_eq!(plan.items[0].sha8.len(), 8);
+        assert_eq!(
+            plan.total_bytes,
+            plan.items.iter().map(|i| i.bytes).sum::<u64>()
+        );
+        assert_eq!(plan.expires_in_seconds, PLAN_TTL.as_secs());
+        assert_eq!(plan.estimated_minutes, 0);
+        assert!(f.events().contains(&"batch_planned".to_string()));
+    }
+
+    #[test]
+    fn the_aggregate_hash_covers_sorted_path_and_hash_lines() {
+        let a = aggregate_sha256([("/x/a", "11"), ("/x/b", "22")]);
+        let b = aggregate_sha256([("/x/b", "22"), ("/x/a", "11")]);
+        assert_eq!(a, b, "input order does not matter");
+        assert_ne!(a, aggregate_sha256([("/x/a", "11"), ("/x/b", "23")]));
+        assert_ne!(a, aggregate_sha256([("/x/a", "11"), ("/x/c", "22")]));
+        let mut h = Sha256::new();
+        h.update(b"/x/a\x0011\n/x/b\x0022\n");
+        assert_eq!(a, hex::encode(h.finalize()));
+    }
+
+    #[test]
+    fn one_refused_file_means_no_plan_and_every_refusal_is_returned() {
+        let f = fixture("");
+        let outside_dir = crate::policy::test_support::temp_dir("batch-outside");
+        let outside = outside_dir.join("x.png");
+        fs::write(&outside, PNG).unwrap();
+        let reference = f.exports.join("reference-images");
+        fs::create_dir_all(&reference).unwrap();
+        fs::write(reference.join("r.png"), PNG).unwrap();
+        let items = vec![
+            f.item("ok.png", "Image"),
+            item_for(&outside, "Image"),
+            item_for(&reference.join("r.png"), "Image"),
+        ];
+        let failure = f.flow.plan_batch(f.request(items)).unwrap_err();
+        assert!(!failure.plan_created);
+        assert_eq!(failure.refused.len(), 2, "{failure}");
+        assert!(failure.refused[0].reason.contains("outside"));
+        assert!(failure.refused[1].reason.contains("deny rule"));
+        assert!(failure.error.contains("no plan was created"));
+        assert!(f.flow.batch_plans.lock().unwrap().is_empty());
+        assert!(!f.events().contains(&"batch_planned".to_string()));
+        assert!(f.flow.audit().verify().ok);
+        let _ = fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn skip_refused_plans_only_the_accepted_files_and_lists_the_rest() {
+        let f = fixture("");
+        let outside_dir = crate::policy::test_support::temp_dir("batch-outside");
+        let outside = outside_dir.join("x.png");
+        fs::write(&outside, PNG).unwrap();
+        let items = vec![
+            f.item("a.png", "Image"),
+            item_for(&outside, "Image"),
+            f.item("b.png", "Image"),
+        ];
+        let mut req = f.request(items);
+        req.skip_refused = true;
+        let plan = f.flow.plan_batch(req).unwrap();
+        assert_eq!(plan.total_files, 2);
+        assert_eq!(plan.refused.len(), 1);
+        assert!(plan.refused[0].reason.contains("outside"));
+        assert!(plan.confirm_phrase.contains("BATCH 2 files (2 Image)"));
+
+        // Everything refused: still no plan.
+        let mut req = f.request(vec![item_for(&outside, "Image")]);
+        req.skip_refused = true;
+        let failure = f.flow.plan_batch(req).unwrap_err();
+        assert_eq!(failure.refused.len(), 1);
+        let _ = fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn per_file_type_and_size_limits_apply() {
+        let f = fixture(r#", "allowed_asset_types": ["Image"], "max_bytes": 60"#);
+        let small = f.item("small.png", "Image");
+        let model = f.item("m.glb", "Model");
+        let big = f.exports.join("big.png");
+        fs::write(&big, [PNG, &[b'y'; 100][..]].concat()).unwrap();
+        let failure = f
+            .flow
+            .plan_batch(f.request(vec![small, model, item_for(&big, "Image")]))
+            .unwrap_err();
+        assert_eq!(failure.refused.len(), 2, "{failure}");
+        assert!(failure.refused[0].reason.contains("does not allow Model"));
+        assert!(failure.refused[1].reason.contains("at most 60"));
+    }
+
+    #[test]
+    fn display_names_and_content_are_checked_like_plan_upload() {
+        let f = fixture("");
+        let mut bad_name = f.item("a.png", "Image");
+        bad_name.display_name = Some("x".repeat(51));
+        let mut not_png = f.item("b.png", "Image");
+        fs::write(f.exports.join("b.png"), b"plain text, not a png at all").unwrap();
+        not_png.display_name = Some("fine".into());
+        let failure = f
+            .flow
+            .plan_batch(f.request(vec![bad_name, not_png, f.item("c.png", "Spaceship")]))
+            .unwrap_err();
+        assert_eq!(failure.refused.len(), 3, "{failure}");
+    }
+
+    #[test]
+    fn refuses_more_files_than_max_batch_files_empty_and_duplicate_batches() {
+        let f = fixture(r#", "max_batch_files": 2"#);
+        let items = vec![
+            f.item("a.png", "Image"),
+            f.item("b.png", "Image"),
+            f.item("c.png", "Image"),
+        ];
+        let failure = f.flow.plan_batch(f.request(items.clone())).unwrap_err();
+        assert!(failure.error.contains("max_batch_files"), "{failure}");
+        // skipRefused does not lift the limit.
+        let mut req = f.request(items.clone());
+        req.skip_refused = true;
+        assert!(f.flow.plan_batch(req).is_err());
+
+        let failure = f.flow.plan_batch(f.request(vec![])).unwrap_err();
+        assert!(failure.error.contains("empty"), "{failure}");
+
+        // Same file twice, spelled twice, and through a `..` detour.
+        let a = items[0].clone();
+        let failure = f
+            .flow
+            .plan_batch(f.request(vec![a.clone(), a.clone()]))
+            .unwrap_err();
+        assert!(failure.error.contains("duplicate"), "{failure}");
+        let mut detour = a.clone();
+        detour.file_path = f
+            .exports
+            .join("..")
+            .join("exports")
+            .join("a.png")
+            .to_string_lossy()
+            .into_owned();
+        let mut req = f.request(vec![a, detour]);
+        req.skip_refused = true;
+        let failure = f.flow.plan_batch(req).unwrap_err();
+        assert!(failure.error.contains("duplicate"), "{failure}");
+        assert!(f.flow.batch_plans.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_default_limit_is_25_files() {
+        let f = fixture("");
+        let items: Vec<_> = (0..26)
+            .map(|i| f.item(&format!("f{i:02}.png"), "Image"))
+            .collect();
+        let failure = f.flow.plan_batch(f.request(items.clone())).unwrap_err();
+        assert!(failure.error.contains("(25)"), "{failure}");
+        assert!(f.flow.plan_batch(f.request(items[..25].to_vec())).is_ok());
+    }
+
+    #[test]
+    fn a_creator_is_needed_for_the_whole_batch() {
+        let f = fixture("");
+        let mut req = f.request(vec![f.item("a.png", "Image")]);
+        req.creator = None;
+        let failure = f.flow.plan_batch(req.clone()).unwrap_err();
+        assert!(failure.error.contains("Ask the user"), "{failure}");
+        req.creator = Some("team".into());
+        let plan = f.flow.plan_batch(req).unwrap();
+        assert!(plan.confirm_phrase.contains("to group 222"));
+    }
+
+    #[test]
+    fn approve_batch_happy_path_audits_and_keeps_the_chain_valid() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image"), f.item("b.glb", "Model")]))
+            .unwrap();
+        let approved = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap();
+        assert_eq!(approved.items.len(), 2);
+        assert_eq!(approved.batch_id, plan.batch_plan_id);
+        assert_eq!(approved.rate_limit_per_minute, 10);
+        assert_eq!(f.events(), ["batch_planned", "batch_approved"]);
+        assert!(f.flow.audit().verify().ok);
+        let one = f.flow.load_batch_item(&approved, 1).unwrap();
+        assert_eq!(one.plan_id, plan.batch_plan_id);
+        assert_eq!(one.display_name, "b");
+    }
+
+    #[test]
+    fn a_changed_file_changes_the_hash_and_approval_rejects_it() {
+        let f = fixture("");
+        let items = vec![f.item("a.png", "Image"), f.item("b.png", "Image")];
+        let first = f.flow.plan_batch(f.request(items.clone())).unwrap();
+        fs::write(f.exports.join("b.png"), [PNG, b"tampered"].concat()).unwrap();
+        let err = f
+            .flow
+            .approve_batch(&first.batch_plan_id, true, &first.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("b.png"), "{err}");
+        assert!(err.to_string().contains("changed"), "{err}");
+        // The aggregate of a fresh plan differs, so the old phrase is stale.
+        let second = f.flow.plan_batch(f.request(items)).unwrap();
+        assert_ne!(first.aggregate_sha256, second.aggregate_sha256);
+        assert_ne!(first.confirm_phrase, second.confirm_phrase);
+        assert!(f.events().contains(&"batch_denied".to_string()));
+    }
+
+    #[test]
+    fn one_bad_file_aborts_the_batch_before_the_first_upload() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image"), f.item("b.png", "Image")]))
+            .unwrap();
+        fs::remove_file(f.exports.join("b.png")).unwrap();
+        assert!(f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .is_err());
+        assert!(!f.events().contains(&"batch_approved".to_string()));
+        // The plan is gone: no retry with the same id.
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or already used"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_phrase_discards_the_plan_and_confirm_false_does_not() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        assert!(f
+            .flow
+            .approve_batch(&plan.batch_plan_id, false, &plan.confirm_phrase)
+            .is_err());
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, "UPLOAD BATCH 1 files (1 Image)")
+            .unwrap_err();
+        assert!(err.to_string().contains("confirmPhrase"), "{err}");
+        let again = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(
+            again.to_string().contains("unknown or already used"),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn a_batch_plan_is_single_use_and_expires() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        f.flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap();
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("single use"), "{err}");
+
+        let f = fixture_with_ttl("", Duration::ZERO);
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn the_policy_is_reloaded_at_approval() {
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image")]))
+            .unwrap();
+        fs::write(f.flow.policy.policy_path(), r#"{ "enabled": false }"#).unwrap();
+        f.flow.policy.sign().unwrap();
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+
+        // A tighter limit after planning is honoured too.
+        let f = fixture("");
+        let plan = f
+            .flow
+            .plan_batch(f.request(vec![f.item("a.png", "Image"), f.item("b.png", "Image")]))
+            .unwrap();
+        let json = format!(
+            r#"{{ "enabled": true, "allowed_roots": ["{}"], "creators": {{ "personal": {{ "userId": "111" }} }}, "max_batch_files": 1 }}"#,
+            f.root
+        );
+        fs::write(f.flow.policy.policy_path(), json).unwrap();
+        f.flow.policy.sign().unwrap();
+        let err = f
+            .flow
+            .approve_batch(&plan.batch_plan_id, true, &plan.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 1"), "{err}");
+    }
+
+    #[test]
+    fn a_running_batch_blocks_a_second_batch_and_single_uploads_and_vice_versa() {
+        let f = fixture("");
+        let first = f.approved(vec![f.item("a.png", "Image")]);
+
+        let second = f
+            .flow
+            .plan_batch(f.request(vec![f.item("b.png", "Image")]))
+            .unwrap();
+        let err = f
+            .flow
+            .approve_batch(&second.batch_plan_id, true, &second.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+
+        let single = f
+            .flow
+            .plan(crate::upload_flow::PlanRequest {
+                file_path: f.exports.join("b.png").to_string_lossy().into_owned(),
+                asset_type: "Image".into(),
+                display_name: "b".into(),
+                description: None,
+                creator: Some("personal".into()),
+                user_id: None,
+                group_id: None,
+            })
+            .unwrap();
+        let err = f
+            .flow
+            .approve(&single.plan_id, true, &single.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("batch upload is running"), "{err}");
+
+        // The refused second call did not burn its plan.
+        drop(first);
+        let held = f
+            .flow
+            .approve_batch(&second.batch_plan_id, true, &second.confirm_phrase)
+            .unwrap();
+        drop(held);
+
+        // A single upload in flight blocks a batch.
+        let single_up = f
+            .flow
+            .approve(&single.plan_id, true, &single.confirm_phrase)
+            .unwrap();
+        let third = f
+            .flow
+            .plan_batch(f.request(vec![f.item("c.png", "Image")]))
+            .unwrap();
+        let err = f
+            .flow
+            .approve_batch(&third.batch_plan_id, true, &third.confirm_phrase)
+            .unwrap_err();
+        assert!(err.to_string().contains("single upload"), "{err}");
+        drop(single_up);
+        assert!(f
+            .flow
+            .approve_batch(&third.batch_plan_id, true, &third.confirm_phrase)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_folder_and_glob_expand_sorted_inside_the_allowed_roots() {
+        let f = fixture("");
+        for name in ["z.png", "m.png", "sub/n.png", "skip.txt"] {
+            f.write(name, "Image");
+        }
+        let req = BatchPlanRequest {
+            folder: Some(f.exports.to_string_lossy().into_owned()),
+            glob: Some("*.png".into()),
+            asset_type: Some("Image".into()),
+            creator: Some("personal".into()),
+            ..Default::default()
+        };
+        let plan = f.flow.plan_batch(req.clone()).unwrap();
+        let names: Vec<&str> = plan.items.iter().map(|i| i.display_name.as_str()).collect();
+        assert_eq!(names, ["m", "z"]);
+
+        let mut deep = req.clone();
+        deep.glob = Some("**/*.png".into());
+        assert_eq!(f.flow.plan_batch(deep).unwrap().total_files, 3);
+
+        // The folder itself must be inside the roots.
+        let mut outside = req.clone();
+        outside.folder = Some(f.exports.parent().unwrap().to_string_lossy().into_owned());
+        let failure = f.flow.plan_batch(outside).unwrap_err();
+        assert!(failure.error.contains("outside"), "{failure}");
+
+        // Mixed or missing forms are errors.
+        let mut both = req.clone();
+        both.items = Some(vec![f.item("q.png", "Image")]);
+        assert!(f.flow.plan_batch(both).is_err());
+        let mut no_type = req.clone();
+        no_type.asset_type = None;
+        assert!(f.flow.plan_batch(no_type).is_err());
+        let mut nothing = req;
+        nothing.folder = None;
+        nothing.items = None;
+        assert!(f.flow.plan_batch(nothing).is_err());
+
+        // A glob that matches more than max_batch_files is refused up front.
+        let small = fixture(r#", "max_batch_files": 1"#);
+        small.write("a.png", "Image");
+        small.write("b.png", "Image");
+        let failure = small
+            .flow
+            .plan_batch(BatchPlanRequest {
+                folder: Some(small.exports.to_string_lossy().into_owned()),
+                glob: Some("*.png".into()),
+                asset_type: Some("Image".into()),
+                creator: Some("personal".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(failure.error.contains("more than 1"), "{failure}");
+    }
+
+    #[test]
+    fn the_rate_limit_estimate_accounts_for_the_window() {
+        assert_eq!(estimate_rate_wait(0, 10, &[]), secs(0));
+        assert_eq!(estimate_rate_wait(10, 10, &[]), secs(0));
+        assert_eq!(estimate_rate_wait(11, 10, &[]), secs(60));
+        assert_eq!(estimate_rate_wait(26, 10, &[]), secs(120));
+        assert_eq!(estimate_rate_wait(1, 1, &[secs(20)]), secs(40));
+        assert_eq!(estimate_rate_wait(3, 2, &[secs(50), secs(10)]), secs(70));
+    }
+
+    #[test]
+    fn the_window_wait_helper_reports_the_time_until_room() {
+        let now = Instant::now();
+        let at = |age: u64| now - secs(age);
+        let mut q: VecDeque<Instant> = VecDeque::new();
+        assert_eq!(window_wait(&q, now, 3), Duration::ZERO);
+        q.extend([at(30), at(20), at(10)]);
+        // room under a bigger limit
+        assert_eq!(window_wait(&q, now, 4), Duration::ZERO);
+        // full: the oldest (30s old) frees a slot in 30s
+        assert_eq!(window_wait(&q, now, 3), secs(30));
+        // limit 2 with 3 live: two must age out, the second oldest is 20s old
+        assert_eq!(window_wait(&q, now, 2), secs(40));
+        // expired entries do not count
+        q.push_front(at(70));
+        assert_eq!(window_wait(&q, now, 3), secs(30));
+        assert_eq!(window_wait(&q, now, 4), Duration::ZERO);
+    }
+}
