@@ -54,10 +54,54 @@ The setup process also contains a small plugin installation and Claude Desktop c
 **OAuth / Open Cloud tools (require setup, see below):**
 - **roblox_login** - One-time browser-based OAuth login. Stores tokens locally.
 - **roblox_logout** - Clear locally stored tokens.
-- **upload_asset** - Upload a local file (Decal/Audio/Model/Animation/Mesh/Video) to your Roblox account.
+- **plan_upload** / **upload_asset** - Upload a local file (Animation, Audio, Decal, Image, Mesh, Model or Video) to your Roblox account or a group: `plan_upload` checks the file against your signed upload policy, `upload_asset` sends it after the exact confirm phrase is given.
+- **plan_upload_batch** / **upload_batch** - The same for many files at once, see [Batch uploads](#batch-uploads).
 - **update_asset** - Replace the contents of an existing asset by ID.
 - **get_asset_info** - Read asset metadata via the Open Cloud Assets API.
 - **list_my_assets** - Page through your inventory items via the v2 inventory endpoint.
+
+## Batch uploads
+
+Batch mode uploads many files with one plan and one confirmation. It uses the same signed policy, audit log and rate limit as single uploads, and every rule of the policy (`allowed_roots`, `deny_globs`, `allowed_asset_types`, per-type and `max_bytes` size limits, `creators`) applies to **each file**. Nothing is uploaded until the plan is confirmed.
+
+**1. `plan_upload_batch`** (uploads nothing)
+
+| Parameter | Meaning |
+|---|---|
+| `items` | `[{ filePath, assetType, displayName?, description? }]`. `displayName` defaults to the file name without its extension. |
+| `folder`, `glob`, `assetType` | Alternative to `items`: expand `glob` under `folder` (sorted). `*.png` matches the top level, `**/*.png` also sub-folders. The folder itself must be inside `allowed_roots`; symlinks are never followed out of it. |
+| `creator` / `userId` / `groupId` | Exactly one; the whole batch goes to that one target. |
+| `skipRefused` | Default `false`. By default one refused file means **no plan** and every refusal is returned with its reason. With `true`, the plan covers the accepted files and the refused ones are listed in the result. |
+
+Empty batches, duplicate files (also the same file under two spellings) and more files than the policy's `max_batch_files` are rejected, even with `skipRefused`. The result has `batchPlanId`, a per-file table (file, type, bytes, first 8 hex of the SHA-256, displayName), the refused list, totals, the expiry (10 minutes), an estimate of the time the rate limit alone will take, and the exact `confirmPhrase`:
+
+```
+UPLOAD BATCH 5 files (3 Model, 2 Image) to user 123 sha:1a2b3c4d
+```
+
+The type counts list the most common type first. The 8 hex digits are the start of a SHA-256 over the sorted lines `{canonical path}\0{file sha256}`, so changing, adding or removing any file changes the phrase. A plan is single use, and a wrong phrase discards it.
+
+**2. `upload_batch`**
+
+| Parameter | Meaning |
+|---|---|
+| `planId` | The `batchPlanId`. |
+| `confirm` | Must be `true`, and only after the user agreed to the exact plan. |
+| `confirmPhrase` | Copied exactly from the plan. |
+| `onError` | `"stop"` (default): halt after the first failed file, the rest are `not_started`. `"continue"`: keep going. |
+| `maxWaitSeconds` | Default 600, at most 3600. Caps the time spent waiting for the rate limit. |
+
+Approval reloads the signed policy and re-checks **every** file (path, type, size, creator, a fresh read, SHA-256 equal to the planned one) before the first upload; one failure aborts the whole batch and nothing is sent. Then the files upload one at a time, in plan order. Each file re-reads and re-verifies its bytes just before it is sent.
+
+*Rate limit.* The policy's `rate_limit_per_minute` is a sliding one-minute window shared with single uploads. When it is full, the batch sleeps until the window has room instead of failing. With the default of 10 per minute, 26 files take at least 2 minutes of waiting. A file is not started if its slot would open only after `maxWaitSeconds` of waiting; it and the remaining files are reported `not_started`. An upload already in flight is polled to completion (up to 60 seconds), so the call can run slightly past `maxWaitSeconds`. The call blocks until the batch ends, so MCP clients need a long enough tool timeout.
+
+*Result.* One entry per file with `status` (`uploaded`, `failed`, `not_started`), `assetId` or `operation`, `moderationState` and `error`, plus `uploaded`/`failed`/`not_started` counts and `elapsedSeconds`. The tool result is flagged as an error when any file failed or was not started, so a partial batch is not reported as done.
+
+*Only one at a time.* A batch holds a lock: a second `upload_batch` while one runs is refused (without using up its plan), and so are single uploads, and a batch is refused while a single upload is in flight.
+
+*Audit log.* `batch_planned`, `batch_approved` or `batch_denied`, then per file `upload_started` and `upload_finished` or `upload_failed`, then `batch_finished` with the summary. They all carry the batch id in the `plan_id` field. If an audit entry cannot be written the batch stops, as with single uploads.
+
+*Policy.* `max_batch_files` (1 to 200, default 25) is optional; a policy signed before it existed keeps working with the default. To change it, edit the policy and run `rbx-studio-mcp policy sign` again.
 
 ## OAuth setup (one-time)
 
