@@ -1,4 +1,6 @@
-//! The two-step upload flow: `plan_upload`, then `upload_asset`.
+//! The two-step upload flow: `plan_upload`, then `upload_asset`. Batch mode
+//! (`plan_upload_batch`, then `upload_batch`) lives in the `batch` and
+//! `batch_exec` sub-modules and reuses the same policy, audit log and rate limit.
 //!
 //! * [`UploadFlow::plan`] checks the signed policy, the file and the target and
 //!   returns a plan (bound to the file's SHA-256, valid for 10 minutes) plus a
@@ -14,7 +16,7 @@
 
 use crate::asset_types::{self, AssetKind, ValidatedFile};
 use crate::audit::{AuditEntry, AuditLog};
-use crate::policy::{PolicyStore, ResolvedCreator};
+use crate::policy::{Policy, PolicyStore, ResolvedCreator};
 use color_eyre::eyre::{eyre, Report, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -23,6 +25,12 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod batch;
+mod batch_exec;
+
+pub use batch::{ApprovedBatch, BatchItemRequest, BatchPlanRequest};
+pub use batch_exec::{run_batch, BatchBackend, OnError};
 
 /// How long a plan stays valid.
 pub const PLAN_TTL: Duration = Duration::from_secs(600);
@@ -82,6 +90,9 @@ pub struct ApprovedUpload {
     pub creator: ResolvedCreator,
     pub display_name: String,
     pub description: String,
+    /// Keeps a batch from starting while this upload is in flight. `None` for
+    /// the items of a batch (the batch holds its own guard).
+    _guard: Option<UploadGuard>,
 }
 
 impl std::fmt::Debug for ApprovedUpload {
@@ -103,12 +114,125 @@ pub struct UploadFlow {
     policy: PolicyStore,
     audit: Arc<AuditLog>,
     plans: Mutex<HashMap<String, Plan>>,
+    batch_plans: Mutex<HashMap<String, batch::BatchPlan>>,
     uploads: Mutex<VecDeque<Instant>>,
+    activity: Arc<Mutex<Activity>>,
     ttl: Duration,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// What is uploading right now: any number of single uploads, or one batch.
+#[derive(Debug, Default)]
+struct Activity {
+    singles: usize,
+    batch: bool,
+}
+
+/// Held while an upload (single or batch) is in flight; releases on drop.
+#[derive(Debug)]
+pub struct UploadGuard {
+    activity: Arc<Mutex<Activity>>,
+    exclusive: bool,
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        let mut a = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if self.exclusive {
+            a.batch = false;
+        } else {
+            a.singles = a.singles.saturating_sub(1);
+        }
+    }
+}
+
+/// How long until the sliding window has room for one more upload; zero when
+/// it has room now. `uploads` holds the start times, oldest first.
+pub(crate) fn window_wait(uploads: &VecDeque<Instant>, now: Instant, limit: u32) -> Duration {
+    let live = uploads
+        .iter()
+        .filter(|t| now.duration_since(**t) < RATE_WINDOW)
+        .count();
+    if live < limit as usize {
+        return Duration::ZERO;
+    }
+    // The live entries are the newest ones; once the `limit`-th newest one has
+    // aged out, one slot is free.
+    let blocking = uploads[uploads.len() - limit as usize];
+    RATE_WINDOW.saturating_sub(now.duration_since(blocking))
+}
+
+/// A file that passed every per-file check. Shared by `plan` and batch
+/// planning so both apply exactly the same rules.
+pub(crate) struct CheckedFile {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub kind: AssetKind,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub display_name: String,
+    pub description: String,
+}
+
+/// Type, names, path, size and content checks for one file, in the order
+/// `plan_upload` has always applied them. The error is the refusal reason.
+pub(crate) fn check_file(
+    policy: &Policy,
+    file_path: &str,
+    asset_type: &str,
+    display_name: &str,
+    description: Option<String>,
+) -> Result<CheckedFile, String> {
+    let kind = AssetKind::parse(asset_type).map_err(|e| e.to_string())?;
+
+    let display_name = display_name.trim().to_string();
+    if display_name.is_empty()
+        || display_name.chars().count() > MAX_DISPLAY_NAME
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "displayName must be 1 to {MAX_DISPLAY_NAME} characters without control characters"
+        ));
+    }
+    let description = description.unwrap_or_default();
+    if description.chars().count() > MAX_DESCRIPTION {
+        return Err(format!(
+            "description is longer than {MAX_DESCRIPTION} characters"
+        ));
+    }
+
+    let path = policy
+        .check_path(Path::new(file_path))
+        .map_err(|e| e.to_string())?;
+    let len = std::fs::metadata(&path)
+        .map_err(|e| format!("cannot read the file ({:?})", e.kind()))?
+        .len();
+    policy
+        .check_kind_and_size(kind, len)
+        .map_err(|e| e.to_string())?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("cannot read the file ({:?})", e.kind()))?;
+    policy
+        .check_kind_and_size(kind, bytes.len() as u64)
+        .map_err(|e| e.to_string())?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "asset".to_string());
+    asset_types::validate_upload(kind, &file_name, &bytes).map_err(|e| e.to_string())?;
+    let sha256 = sha256_hex(&bytes);
+    Ok(CheckedFile {
+        path,
+        file_name,
+        kind,
+        bytes,
+        sha256,
+        display_name,
+        description,
+    })
 }
 
 impl UploadFlow {
@@ -117,7 +241,9 @@ impl UploadFlow {
             policy,
             audit,
             plans: Mutex::new(HashMap::new()),
+            batch_plans: Mutex::new(HashMap::new()),
             uploads: Mutex::new(VecDeque::new()),
+            activity: Arc::new(Mutex::new(Activity::default())),
             ttl: PLAN_TTL,
         }
     }
@@ -164,46 +290,22 @@ impl UploadFlow {
             .policy
             .load_enabled()
             .map_err(|e| self.refusal(&base, e))?;
-        let kind = AssetKind::parse(&req.asset_type).map_err(|e| self.refusal(&base, e))?;
-
-        let display_name = req.display_name.trim().to_string();
-        if display_name.is_empty()
-            || display_name.chars().count() > MAX_DISPLAY_NAME
-            || display_name.chars().any(char::is_control)
-        {
-            return Err(self.refusal(
-                &base,
-                format!("displayName must be 1 to {MAX_DISPLAY_NAME} characters without control characters"),
-            ));
-        }
-        let description = req.description.unwrap_or_default();
-        if description.chars().count() > MAX_DESCRIPTION {
-            return Err(self.refusal(
-                &base,
-                format!("description is longer than {MAX_DESCRIPTION} characters"),
-            ));
-        }
-
-        let path = policy
-            .check_path(Path::new(&req.file_path))
-            .map_err(|e| self.refusal(&base, e))?;
-        let len = std::fs::metadata(&path)
-            .map_err(|e| self.refusal(&base, format!("cannot read the file ({:?})", e.kind())))?
-            .len();
-        policy
-            .check_kind_and_size(kind, len)
-            .map_err(|e| self.refusal(&base, e))?;
-        let bytes = std::fs::read(&path)
-            .map_err(|e| self.refusal(&base, format!("cannot read the file ({:?})", e.kind())))?;
-        policy
-            .check_kind_and_size(kind, bytes.len() as u64)
-            .map_err(|e| self.refusal(&base, e))?;
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "asset".to_string());
-        asset_types::validate_upload(kind, &file_name, &bytes)
-            .map_err(|e| self.refusal(&base, e))?;
+        let CheckedFile {
+            path,
+            file_name,
+            kind,
+            bytes,
+            sha256,
+            display_name,
+            description,
+        } = check_file(
+            &policy,
+            &req.file_path,
+            &req.asset_type,
+            &req.display_name,
+            req.description,
+        )
+        .map_err(|e| self.refusal(&base, e))?;
 
         let creator = policy
             .resolve_creator(
@@ -213,7 +315,6 @@ impl UploadFlow {
             )
             .map_err(|e| self.refusal(&base, e))?;
 
-        let sha256 = sha256_hex(&bytes);
         let confirm_phrase = format!(
             "UPLOAD {file_name} as {kind} to {} sha:{}",
             creator.creator.label(),
@@ -266,7 +367,9 @@ impl UploadFlow {
         })
     }
 
-    fn take_upload_slot(&self, limit: u32) -> Result<(), Duration> {
+    /// Take a slot in the sliding one-minute window, or say how long until
+    /// one is free. Shared by single uploads and batches.
+    pub(crate) fn take_upload_slot(&self, limit: u32) -> Result<(), Duration> {
         let mut uploads = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         while uploads
@@ -275,12 +378,47 @@ impl UploadFlow {
         {
             uploads.pop_front();
         }
-        if uploads.len() >= limit as usize {
-            let oldest = *uploads.front().expect("limit is at least 1");
-            return Err(RATE_WINDOW.saturating_sub(now.duration_since(oldest)));
+        let wait = window_wait(&uploads, now, limit);
+        if !wait.is_zero() {
+            return Err(wait);
         }
         uploads.push_back(now);
         Ok(())
+    }
+
+    /// Mark a single upload as in flight, unless a batch is running.
+    fn begin_single(&self) -> Result<UploadGuard, Report> {
+        let mut a = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if a.batch {
+            return Err(eyre!(
+                "a batch upload is running; wait for upload_batch to finish, then plan again"
+            ));
+        }
+        a.singles += 1;
+        Ok(UploadGuard {
+            activity: self.activity.clone(),
+            exclusive: false,
+        })
+    }
+
+    /// Mark a batch as running, unless anything else is uploading.
+    fn begin_batch(&self) -> Result<UploadGuard, Report> {
+        let mut a = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if a.batch {
+            return Err(eyre!(
+                "another batch upload is already running; wait for it to finish"
+            ));
+        }
+        if a.singles > 0 {
+            return Err(eyre!(
+                "a single upload is still in progress; wait for it to finish"
+            ));
+        }
+        a.batch = true;
+        Ok(UploadGuard {
+            activity: self.activity.clone(),
+            exclusive: true,
+        })
     }
 
     /// Step 2: consume the plan and re-verify everything. The plan is removed
@@ -296,6 +434,7 @@ impl UploadFlow {
                 "confirm must be true, and only after the user agreed to this exact upload"
             ));
         }
+        let guard = self.begin_single()?;
         let plan = self
             .plans
             .lock()
@@ -375,6 +514,7 @@ impl UploadFlow {
             creator: plan.creator,
             display_name: plan.display_name,
             description: plan.description,
+            _guard: Some(guard),
         })
     }
 

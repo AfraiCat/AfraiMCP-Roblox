@@ -4,11 +4,14 @@ use crate::error::{Report, Result};
 use crate::oauth;
 use crate::open_cloud::OpenCloudClient;
 use crate::secret_store::redact;
-use crate::upload_flow::{ApprovedUpload, PlanRequest, UploadFlow};
+use crate::upload_flow::{
+    run_batch, ApprovedBatch, ApprovedUpload, BatchBackend, BatchItemRequest, BatchPlanRequest,
+    OnError, PlanRequest, UploadFlow,
+};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
-use color_eyre::eyre::{eyre, Error, OptionExt};
+use color_eyre::eyre::{eyre, Error, OptionExt, Result as EyreResult};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -126,12 +129,14 @@ pub enum ServerMode {
 
 /// Tools that need no Studio plugin and stay available in `ServerMode::Cloud`.
 /// Everything else is removed from the tool router in that mode.
-pub const CLOUD_TOOLS: [&str; 8] = [
+pub const CLOUD_TOOLS: [&str; 10] = [
     "cloud_auth_status",
     "roblox_login",
     "roblox_logout",
     "plan_upload",
     "upload_asset",
+    "plan_upload_batch",
+    "upload_batch",
     "audit_log_tail",
     "get_asset_info",
     "list_my_assets",
@@ -173,6 +178,8 @@ Only upload when the user asked for it in this conversation, and ask where to up
 - roblox_logout: Clear locally stored OAuth tokens.
 - plan_upload: Step 1. Check a local file against the user's signed upload policy; uploads nothing. Pass the creator (ask the user where to upload).
 - upload_asset: Step 2. Send a planned file to Roblox with planId, confirm and the exact confirmPhrase, only after the user agreed.
+- plan_upload_batch: Batch step 1. Check many files (an items list, or a folder + glob + assetType) against the policy; uploads nothing. All files must pass unless skipRefused is set.
+- upload_batch: Batch step 2. Upload a planned batch one file at a time, waiting for the rate limit, with planId, confirm and the exact confirmPhrase, only after the user agreed. onError stop|continue, maxWaitSeconds.
 - audit_log_tail: Recent upload audit entries and whether the log verifies.
 - get_asset_info: Read asset metadata by ID.
 - list_my_assets: Page through a user's inventory."
@@ -209,6 +216,8 @@ Open Cloud tools (an API key stored with `rbx-studio-mcp set-key`, or optional O
 - roblox_logout: Revoke locally stored OAuth tokens.
 - plan_upload: Step 1. Check a local file against the signed upload policy; uploads nothing.
 - upload_asset: Step 2. Send a planned file with planId, confirm and the exact confirmPhrase, only after the user agreed.
+- plan_upload_batch: Batch step 1. Check many files (an items list, or a folder + glob + assetType) against the signed policy; uploads nothing.
+- upload_batch: Batch step 2. Upload a planned batch sequentially within the rate limit with planId, confirm and the exact confirmPhrase, only after the user agreed.
 - audit_log_tail: Recent upload audit entries.
 - get_asset_info: Read asset metadata by ID.
 - list_my_assets: Page through a user's inventory.
@@ -405,6 +414,124 @@ struct UploadAsset {
     #[serde(rename = "confirmPhrase")]
     #[schemars(description = "The confirmPhrase from the plan, copied exactly")]
     confirm_phrase: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct BatchItemArg {
+    #[serde(rename = "filePath")]
+    #[schemars(description = "Absolute path to the local file. Max 20MB.")]
+    file_path: String,
+    #[serde(rename = "assetType")]
+    #[schemars(
+        description = "One of: Animation, Audio, Decal, Image, Mesh, Model, Video (case-insensitive); the same extension and content rules as plan_upload"
+    )]
+    asset_type: String,
+    #[serde(rename = "displayName")]
+    #[schemars(
+        description = "Display name (1-50 characters). Defaults to the file name without its extension."
+    )]
+    display_name: Option<String>,
+    #[schemars(description = "Optional description (up to 1000 characters)")]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct PlanUploadBatch {
+    #[schemars(
+        description = "The files to upload. Give either items, or folder + glob + assetType. At most the policy's max_batch_files (default 25, up to 200)."
+    )]
+    items: Option<Vec<BatchItemArg>>,
+    #[schemars(
+        description = "Absolute path of a folder to expand with glob. The folder itself must be inside the policy's allowed_roots."
+    )]
+    folder: Option<String>,
+    #[schemars(
+        description = "Glob matched against paths relative to folder, with / separators, case-insensitive: '*.png' is the top level only, '**/*.png' includes sub-folders. Only used with folder."
+    )]
+    glob: Option<String>,
+    #[serde(rename = "assetType")]
+    #[schemars(
+        description = "Asset type for every file matched by folder + glob (same values as plan_upload). Only used with folder."
+    )]
+    asset_type: Option<String>,
+    #[schemars(
+        description = "Where to upload, as a creator alias from the user's policy. Give exactly one of creator, userId or groupId; the whole batch goes to one target. If the user has not said where to upload, ask them first."
+    )]
+    creator: Option<String>,
+    #[serde(rename = "userId")]
+    #[schemars(description = "Upload under this numeric user ID (personal account)")]
+    user_id: Option<String>,
+    #[serde(rename = "groupId")]
+    #[schemars(description = "Upload under this numeric group ID")]
+    group_id: Option<String>,
+    #[serde(rename = "skipRefused")]
+    #[schemars(
+        description = "Default false: if any file is refused, no plan is created and every refusal is returned. If true, the plan covers only the accepted files and the refused ones are listed in the result."
+    )]
+    skip_refused: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct UploadBatch {
+    #[serde(rename = "planId")]
+    #[schemars(description = "The batchPlanId returned by plan_upload_batch")]
+    plan_id: String,
+    #[schemars(
+        description = "Must be true, and only after the user agreed to the exact batch in the plan summary"
+    )]
+    confirm: bool,
+    #[serde(rename = "confirmPhrase")]
+    #[schemars(description = "The confirmPhrase from the batch plan, copied exactly")]
+    confirm_phrase: String,
+    #[serde(rename = "onError")]
+    #[schemars(
+        description = "\"stop\" (default): halt after the first failed file and report the rest as not_started. \"continue\": keep going."
+    )]
+    on_error: Option<String>,
+    #[serde(rename = "maxWaitSeconds")]
+    #[schemars(
+        description = "Longest time the batch may spend waiting for the upload rate limit before it gives up on the remaining files (reported not_started). Default 600, at most 3600."
+    )]
+    max_wait_seconds: Option<u64>,
+}
+
+/// Open Cloud side of a running batch; the executor drives it.
+struct CloudBatchBackend<'a> {
+    flow: &'a UploadFlow,
+    client: OpenCloudClient,
+    batch: &'a ApprovedBatch,
+    started: std::time::Instant,
+}
+
+impl BatchBackend for CloudBatchBackend<'_> {
+    fn try_slot(&self) -> Result<(), Duration> {
+        self.flow.take_upload_slot(self.batch.rate_limit_per_minute)
+    }
+
+    async fn prepare(&self, index: usize) -> EyreResult<ApprovedUpload> {
+        // One file at a time: a read and a hash, short next to the upload.
+        self.flow.load_batch_item(self.batch, index)
+    }
+
+    async fn start(&self, approved: &ApprovedUpload) -> EyreResult<String> {
+        self.client.start_upload(approved).await
+    }
+
+    async fn finish(&self, operation: &str) -> EyreResult<serde_json::Value> {
+        self.client.finish_operation(operation, 60).await
+    }
+
+    fn record(&self, entry: AuditEntry) -> EyreResult<()> {
+        self.flow.record(entry)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
@@ -863,6 +990,87 @@ impl RBXStudioServer {
     }
 
     #[tool(
+        description = "Batch step 1 of uploading many local files to Roblox: check every file against the user's signed upload policy (path, type, size, content, creator, exactly as plan_upload does) and return one plan. Uploads nothing. Only use when the user asked for an upload in this conversation. Give either items (filePath, assetType, optional displayName and description per file) or folder + glob + assetType. Pass creator (a policy alias), or userId, or groupId for the whole batch; if the user has not said where to upload, ask them first. By default, if any file is refused, no plan is created and every refusal is returned; with skipRefused: true only the accepted files are planned. At most the policy's max_batch_files files (default 25, up to 200); duplicates are rejected. Show the returned table, totals and estimated time to the user, and only after they agree call upload_batch with planId (the batchPlanId), confirm: true and confirmPhrase exactly as returned."
+    )]
+    async fn plan_upload_batch(
+        &self,
+        Parameters(args): Parameters<PlanUploadBatch>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let flow = self.flow.clone();
+        let request = BatchPlanRequest {
+            items: args.items.map(|items| {
+                items
+                    .into_iter()
+                    .map(|i| BatchItemRequest {
+                        file_path: i.file_path,
+                        asset_type: i.asset_type,
+                        display_name: i.display_name,
+                        description: i.description,
+                    })
+                    .collect()
+            }),
+            folder: args.folder,
+            glob: args.glob,
+            asset_type: args.asset_type,
+            creator: args.creator,
+            user_id: args.user_id,
+            group_id: args.group_id,
+            skip_refused: args.skip_refused.unwrap_or(false),
+        };
+        // Reading and hashing the files is blocking work.
+        match tokio::task::spawn_blocking(move || flow.plan_batch(request)).await {
+            Ok(Ok(summary)) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&summary).unwrap_or_default(),
+            )])),
+            Ok(Err(failure)) => Ok(cloud_error(
+                serde_json::to_string_pretty(&failure).unwrap_or_else(|_| failure.to_string()),
+            )),
+            Err(e) => Ok(cloud_error(format!("plan_upload_batch failed: {e}"))),
+        }
+    }
+
+    #[tool(
+        description = "Batch step 2 of uploading: send the files named by a plan from plan_upload_batch to Roblox, one at a time, only after the user agreed to that exact batch. Needs planId (the batchPlanId), confirm: true and the exact confirmPhrase. Plans are single use and expire after 10 minutes. Every file is re-checked against the signed policy and its planned hash before the first upload; one failure aborts the whole batch before anything is sent. Then the files upload sequentially and the call waits for the upload rate limit between files (this can take minutes; the plan shows an estimate). onError: stop (default) halts after the first failed file, continue goes on. maxWaitSeconds (default 600, max 3600) caps the time spent waiting for the rate limit; files not reached are reported not_started. Only one batch can run at a time. Returns a per-file status (uploaded, failed, not_started) with asset IDs, plus counts and elapsed time."
+    )]
+    async fn upload_batch(
+        &self,
+        Parameters(args): Parameters<UploadBatch>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let on_error = match OnError::parse(args.on_error.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return Ok(cloud_error(format!("Batch refused: {e}"))),
+        };
+        let max_wait = Duration::from_secs(args.max_wait_seconds.unwrap_or(600).clamp(1, 3600));
+        let flow = self.flow.clone();
+        let (plan_id, confirm, phrase) = (args.plan_id, args.confirm, args.confirm_phrase);
+        let approved = match tokio::task::spawn_blocking(move || {
+            flow.approve_batch(&plan_id, confirm, &phrase)
+        })
+        .await
+        {
+            Ok(Ok(approved)) => approved,
+            Ok(Err(e)) => return Ok(cloud_error(format!("Batch refused: {e}"))),
+            Err(e) => return Ok(cloud_error(format!("Batch failed: {e}"))),
+        };
+
+        let backend = CloudBatchBackend {
+            flow: &self.flow,
+            client: self.open_cloud(),
+            batch: &approved,
+            started: std::time::Instant::now(),
+        };
+        let result = run_batch(&backend, &approved, on_error, max_wait).await;
+        let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+        if result.failed == 0 && result.not_started == 0 {
+            Ok(CallToolResult::success(vec![Content::text(text)]))
+        } else {
+            // Partial results are still in the text; the error flag tells the
+            // agent not to report the batch as done.
+            Ok(cloud_error(text))
+        }
+    }
+
+    #[tool(
         description = "Show the newest entries of the upload audit log (plans, approvals, denials, uploads) and whether the hash chain still verifies. Never contains secrets."
     )]
     async fn audit_log_tail(
@@ -1288,10 +1496,10 @@ mod tests {
     }
 
     #[test]
-    fn cloud_tools_are_the_documented_eight_and_studio_adds_seventeen() {
-        assert_eq!(CLOUD_TOOLS.len(), 8);
-        assert_eq!(tool_names(&server(ServerMode::Studio)).len(), 25);
-        assert_eq!(tool_names(&server(ServerMode::Cloud)).len(), 8);
+    fn cloud_tools_are_the_documented_ten_and_studio_adds_seventeen() {
+        assert_eq!(CLOUD_TOOLS.len(), 10);
+        assert_eq!(tool_names(&server(ServerMode::Studio)).len(), 27);
+        assert_eq!(tool_names(&server(ServerMode::Cloud)).len(), 10);
     }
 
     #[test]
@@ -1311,6 +1519,106 @@ mod tests {
         for forbidden in ["filePath", "userId", "groupId", "assetType"] {
             assert!(!schema.contains(forbidden), "{forbidden} present: {schema}");
         }
+    }
+
+    #[test]
+    fn upload_batch_takes_only_a_plan_and_the_phrase_not_paths() {
+        let s = server(ServerMode::Cloud);
+        let tool = s
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "upload_batch")
+            .unwrap();
+        let schema = serde_json::to_string(&tool).unwrap();
+        for field in [
+            "planId",
+            "confirm",
+            "confirmPhrase",
+            "onError",
+            "maxWaitSeconds",
+        ] {
+            assert!(schema.contains(field), "{field} missing: {schema}");
+        }
+        for forbidden in ["filePath", "folder", "userId", "groupId", "assetType"] {
+            assert!(!schema.contains(forbidden), "{forbidden} present: {schema}");
+        }
+        let plan = s
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "plan_upload_batch")
+            .unwrap();
+        let schema = serde_json::to_string(&plan).unwrap();
+        for field in [
+            "items",
+            "folder",
+            "glob",
+            "assetType",
+            "userId",
+            "groupId",
+            "skipRefused",
+            "filePath",
+        ] {
+            assert!(schema.contains(field), "{field} missing: {schema}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_batch_without_a_plan_is_refused_before_any_network_call() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .upload_batch(Parameters(UploadBatch {
+                plan_id: "made-up".to_string(),
+                confirm: true,
+                confirm_phrase: "UPLOAD BATCH anything".to_string(),
+                on_error: None,
+                max_wait_seconds: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("unknown or already used"), "{text}");
+
+        let bad = s
+            .upload_batch(Parameters(UploadBatch {
+                plan_id: "x".to_string(),
+                confirm: true,
+                confirm_phrase: "x".to_string(),
+                on_error: Some("explode".to_string()),
+                max_wait_seconds: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result_text(&bad).contains("onError"),
+            "{}",
+            result_text(&bad)
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_upload_batch_without_a_policy_explains_how_to_create_one() {
+        let s = server(ServerMode::Cloud);
+        let result = s
+            .plan_upload_batch(Parameters(PlanUploadBatch {
+                items: Some(vec![BatchItemArg {
+                    file_path: "C:/anything.glb".to_string(),
+                    asset_type: "Model".to_string(),
+                    display_name: None,
+                    description: None,
+                }]),
+                folder: None,
+                glob: None,
+                asset_type: None,
+                creator: Some("personal".to_string()),
+                user_id: None,
+                group_id: None,
+                skip_refused: None,
+            }))
+            .await
+            .unwrap();
+        assert!(result_text(&result).contains("policy init"));
     }
 
     #[tokio::test]
@@ -1404,7 +1712,7 @@ mod tests {
         use crate::asset_types::AssetKind;
         for mode in [ServerMode::Studio, ServerMode::Cloud] {
             let s = server(mode);
-            for name in ["plan_upload"] {
+            for name in ["plan_upload", "plan_upload_batch"] {
                 let tool = s
                     .tool_router
                     .list_all()
@@ -1414,7 +1722,7 @@ mod tests {
                 let text = serde_json::to_string(&tool).unwrap();
                 assert!(!text.contains("ModelFromFbx"), "{name}: {text}");
                 assert!(!text.contains("MeshPart"), "{name}: {text}");
-                if name == "plan_upload" {
+                if name.starts_with("plan_upload") {
                     for kind in AssetKind::ALL {
                         assert!(text.contains(kind.api_name()), "{name} lacks {kind}");
                     }
