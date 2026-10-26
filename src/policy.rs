@@ -408,7 +408,8 @@ impl Policy {
                     found.insert(normalize(&candidate));
                     if found.len() > limit {
                         return Err(PolicyError::Denied(format!(
-                            "the glob matches more than {limit} files (max_batch_files);                              narrow the glob or split the batch"
+                            "the glob matches more than {limit} files (max_batch_files); \
+                             narrow the glob or split the batch"
                         )));
                     }
                 }
@@ -991,15 +992,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "needs Developer Mode or elevation to create symlinks"]
     fn a_symlink_out_of_the_root_is_refused() {
         let dir = temp_dir("policy-link");
         let outside_dir = temp_dir("policy-link-out");
         let target = write_file(&outside_dir, "secret.glb", b"x");
         fs::create_dir_all(dir.join("exports")).unwrap();
-        if std::os::windows::fs::symlink_file(&target, dir.join("exports/link.glb")).is_err() {
-            eprintln!("skipped: creating symlinks needs Developer Mode or elevation");
-            return;
-        }
+        std::os::windows::fs::symlink_file(&target, dir.join("exports/link.glb"))
+            .expect("creating symlinks needs Developer Mode or elevation");
         let (store, pdir, _) =
             signed_store(&policy_json(&format!("{}/exports", root_of(&dir)), ""));
         let policy = store.load_enabled().unwrap();
@@ -1167,21 +1167,96 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "needs Developer Mode or elevation to create symlinks"]
     fn expanding_a_folder_leaves_out_symlinks_that_escape_it() {
         let dir = temp_dir("policy-expand-link");
         let outside_dir = temp_dir("policy-expand-link-out");
         let target = write_file(&outside_dir, "secret.png", b"x");
         write_file(&dir, "in/ok.png", b"x");
-        if std::os::windows::fs::symlink_file(&target, dir.join("in/link.png")).is_err() {
-            eprintln!("skipped: creating symlinks needs Developer Mode or elevation");
-            return;
-        }
+        std::os::windows::fs::symlink_file(&target, dir.join("in/link.png"))
+            .expect("creating symlinks needs Developer Mode or elevation");
         let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
         let policy = store.load_enabled().unwrap();
         let listing = policy.expand_folder(&dir.join("in"), "*.png", 10).unwrap();
         assert_eq!(listing.files.len(), 1);
         assert_eq!(listing.skipped.len(), 1);
         for d in [dir, outside_dir, pdir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    /// Create a directory junction (`mklink /J`), which needs no privileges.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd.exe runs");
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_pointing_out_of_the_folder_is_neither_followed_nor_listed() {
+        let dir = temp_dir("policy-junction");
+        let outside_dir = temp_dir("policy-junction-out");
+        write_file(&outside_dir, "secret.png", b"x");
+        write_file(&outside_dir, "deep/secret2.png", b"x");
+        write_file(&dir, "in/ok.png", b"x");
+        let junction = dir.join("in/escape");
+        make_junction(&junction, &outside_dir);
+        // A junction to a folder inside the root is not followed either.
+        write_file(&dir, "in/real/inner.png", b"x");
+        let inner = dir.join("in/alias");
+        make_junction(&inner, &dir.join("in/real"));
+
+        let (store, pdir, _) = signed_store(&policy_json(&root_of(&dir), ""));
+        let policy = store.load_enabled().unwrap();
+        let listing = policy
+            .expand_folder(&dir.join("in"), "**/*.png", 10)
+            .unwrap();
+        let names: Vec<String> = listing
+            .files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains("secret")),
+            "followed a junction out of the folder: {names:?}"
+        );
+        assert!(names.iter().any(|n| n.ends_with("in/ok.png")), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.ends_with("in/real/inner.png")),
+            "{names:?}"
+        );
+        // The alias junction was not followed, so inner.png is listed once.
+        assert_eq!(
+            names.iter().filter(|n| n.ends_with("inner.png")).count(),
+            1,
+            "{names:?}"
+        );
+        assert!(
+            listing
+                .skipped
+                .iter()
+                .any(|(path, _)| path.ends_with("in/escape")),
+            "{:?}",
+            listing.skipped
+        );
+        // A file reached through the junction is refused by the path check too.
+        let through = junction.join("secret.png");
+        let root = format!("{}/in", root_of(&dir));
+        let (store2, pdir2, _) = signed_store(&policy_json(&root, ""));
+        assert!(store2.load_enabled().unwrap().check_path(&through).is_err());
+
+        // Remove the junctions themselves first, never what they point at.
+        fs::remove_dir(&junction).unwrap();
+        fs::remove_dir(&inner).unwrap();
+        assert!(outside_dir.join("secret.png").exists());
+        for d in [dir, outside_dir, pdir, pdir2] {
             let _ = fs::remove_dir_all(d);
         }
     }
