@@ -4,7 +4,8 @@
 //!   `plan_upload` on every file (policy, path, type, size, content, names),
 //!   resolves one creator for the whole batch and returns a plan plus a
 //!   `confirm_phrase` that names the file count, the types, the creator and a
-//!   hash over every path and file hash. It uploads nothing.
+//!   hash over every file's path, SHA-256, type, display name and description
+//!   hash. It uploads nothing.
 //! * [`UploadFlow::approve_batch`] consumes the plan (single use), reloads the
 //!   signed policy and re-checks **every** file (path, type, size, creator,
 //!   file re-read, SHA equals the planned one) before returning. One failure
